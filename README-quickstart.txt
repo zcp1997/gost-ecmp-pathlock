@@ -20,8 +20,12 @@ Standalone：
     2) 列出已有配置和端口路径
     3) 选择一个 CN 线路，增删端口转发
     4) 查看线路 JSONL 日志
+    5) 删除一个 CN 线路实例（会重启共享 GOST，让剩余线路重连）
+    6) 完全卸载全部 PathLock 运行组件、配置、JSONL 日志和 systemd 单元
 
 多线路会直接显示编号选择器，不需要手动设置 CN_INSTANCE。
+也可直接执行：bash standalone-install.sh instance remove jp
+完全卸载：bash standalone-install.sh uninstall（需输入 DELETE ALL 确认）。
 
 建议顺序：
   1. 先安装 Remote，设置鉴权密码并记录公网 IPv4、MTCP 端口和密码

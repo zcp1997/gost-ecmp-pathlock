@@ -109,15 +109,19 @@ fi
 rm -rf "$compile_test_dir"
 pass "route compiler enforces aggregate uniqueness and fragment ownership"
 
+[[ "$(bash standalone-install.sh --version)" == *"v2.2.0" ]] || \
+    fail "standalone version was not bumped for destructive lifecycle management"
 help_output="$(bash standalone-install.sh --help)"
 [[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* && \
-   "$help_output" == *"NO_COLOR"* ]] || fail "standalone help misses menu or automation compatibility"
+   "$help_output" == *"instance remove"* && "$help_output" == *"uninstall"* && \
+   "$help_output" == *"NO_COLOR"* ]] || fail "standalone help misses management or automation commands"
 pipe_help="$(bash -s -- --help < standalone-install.sh)"
 [[ "$pipe_help" == *"打开统一管理菜单"* ]] || fail "piped standalone help failed"
 pass "standalone supports the management menu plus file and piped execution"
 
 (
     integration_dir="$(mktemp -d "${TMPDIR:-/tmp}/standalone-integration.XXXXXX")"
+    integration_dir="$(cd -P "$integration_dir" && pwd -P)"
     trap 'rm -rf "$integration_dir"' EXIT
     mkdir -p "$integration_dir/bin" "$integration_dir/systemd" "$integration_dir/systemctl-state"
     cat > "$integration_dir/bin/systemctl-mock" <<MOCK
@@ -152,6 +156,10 @@ case "\$command_name" in
     ;;
   restart)
     [[ "\${MOCK_FAIL_RESTART:-0}" == 1 ]] && exit 1
+    if [[ -n "\${MOCK_FAIL_RESTART_ONCE_FILE:-}" && ! -e "\$MOCK_FAIL_RESTART_ONCE_FILE" ]]; then
+      touch "\$MOCK_FAIL_RESTART_ONCE_FILE"
+      exit 1
+    fi
     for unit in "\$@"; do
       touch "\$state_dir/\$unit"
       [[ "\${MOCK_FAIL_RESTART_UNIT:-}" != "\$unit" ]] || exit 1
@@ -162,6 +170,18 @@ case "\$command_name" in
     for unit in "\$@"; do rm -f "\$state_dir/\$unit"; done
     ;;
   show) echo 0 ;;
+  list-units)
+    for state in "\$state_dir"/*.service; do
+      [[ -f "\$state" ]] || continue
+      printf '%s loaded active running mock\n' "\$(basename "\$state")"
+    done
+    ;;
+  list-unit-files)
+    for file in "\$systemd_dir"/*.service; do
+      [[ -e "\$file" || -L "\$file" ]] || continue
+      printf '%s enabled\n' "\$(basename "\$file")"
+    done
+    ;;
   daemon-reload)
     [[ "\${MOCK_FAIL_DAEMON_RELOAD:-0}" != 1 ]]
     ;;
@@ -190,6 +210,8 @@ MOCK
     trap 'rm -rf "$integration_dir"' EXIT
     EMBEDDED_SOURCE="$ROOT_DIR/standalone-install.sh"
     INSTALL_BASE="$integration_dir/install"
+    PATHLOCK_RUNTIME_DIR="$integration_dir/run"
+    mkdir -p "$PATHLOCK_RUNTIME_DIR"
     export MTCP_AUTH_PASSWORD="PathLock-Integration#2026"
     valid_mtcp_auth_password "$MTCP_AUTH_PASSWORD" || fail "valid MTCP password was rejected"
     if valid_mtcp_auth_password "too-short"; then fail "short MTCP password was accepted"; fi
@@ -621,8 +643,10 @@ MOCK
     main_menu_output="$(interactive_main_menu)"
     [[ "$main_menu_output" == *"GOST ECMP PathLock Manager"* && \
        "$main_menu_output" == *"[1]  安装 / 新增线路"* && \
+       "$main_menu_output" == *"[5]  删除 CN 线路实例"* && \
+       "$main_menu_output" == *"[6]  完全卸载 PathLock"* && \
        "$main_menu_output" == *"线路 jp"* && "$main_menu_output" == *"已退出"* ]] || \
-        fail "top-level management dashboard did not dispatch configuration listing"
+        fail "top-level management dashboard did not expose all management actions"
     PROMPTS=(invalid q); PROMPT_INDEX=0
     invalid_menu_output="$integration_dir/invalid-menu.out"
     interactive_main_menu >"$invalid_menu_output" 2>&1
@@ -756,6 +780,69 @@ MOCK
     set -e
     (( reinstall_rc != 0 )) || fail "active CN reinstall was not refused"
 
+    cp -p "$us/mtcp.conf" "$integration_dir/us.mtcp.conf.unit-guard"
+    sed -i.bak 's/^WATCHDOG_UNIT=.*/WATCHDOG_UNIT="sshd.service"/' "$us/mtcp.conf"
+    rm -f "$us/mtcp.conf.bak"
+    set +e
+    ( PROMPTS=(y); PROMPT_INDEX=0; remove_cn_instance us >/dev/null 2>&1 )
+    hostile_unit_guard_rc=$?
+    set -e
+    (( hostile_unit_guard_rc != 0 )) || fail "instance removal trusted a foreign systemd unit from config"
+    mv -f "$integration_dir/us.mtcp.conf.unit-guard" "$us/mtcp.conf"
+
+    mkdir -p "$INSTALL_BASE/cn/instances/orphan"
+    printf '%s\n' 'ROUTE_ID="orphan"' > "$INSTALL_BASE/cn/instances/orphan/mtcp.conf"
+    set +e
+    ( PROMPTS=(y); PROMPT_INDEX=0; remove_cn_instance us >/dev/null 2>&1 )
+    orphan_guard_rc=$?
+    set -e
+    (( orphan_guard_rc != 0 )) || fail "instance removal ignored an orphaned remaining config"
+    [[ -d "$us" ]] || fail "orphan guard ran after deleting the requested instance"
+    rm -rf "$INSTALL_BASE/cn/instances/orphan"
+
+    PROMPTS=(n); PROMPT_INDEX=0
+    remove_cn_instance us >/dev/null 2>&1 || fail "cancelled instance removal returned an error"
+    [[ -d "$us" ]] && grep -Fq 'chain-mtcp-us' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "cancelled instance removal modified the us route"
+
+    remove_once="$integration_dir/remove-instance-restart.failed-once"
+    set +e
+    ( export MOCK_FAIL_RESTART_ONCE_FILE="$remove_once"
+      PROMPTS=(y); PROMPT_INDEX=0
+      remove_cn_instance us >/dev/null 2>&1 )
+    remove_rollback_rc=$?
+    set -e
+    (( remove_rollback_rc != 0 )) || fail "instance removal restart failure unexpectedly succeeded"
+    [[ -d "$us" && -f "$SYSTEMD_DIR/gost-mtcp-us-anchor.service" && \
+       -f "$SYSTEMD_DIR/gost-mtcp-us-watchdog.service" ]] || \
+        fail "failed instance removal did not restore us files and units"
+    grep -Fq 'chain-mtcp-us' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "failed instance removal did not restore aggregate runtime"
+    [[ -f "$integration_dir/systemctl-state/gost-mtcp.service" && \
+       -f "$integration_dir/systemctl-state/gost-mtcp-us-watchdog.service" ]] || \
+        fail "failed instance removal did not restore running services"
+
+    printf '%s\n' removal-log > "$us/state/remove-me.jsonl"
+    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-prewarm.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-watchdog.lock"
+    PROMPTS=(y); PROMPT_INDEX=0
+    remove_cn_instance us >/dev/null
+    [[ ! -e "$us" ]] || fail "instance removal retained the us directory or logs"
+    ! grep -Fq 'chain-mtcp-us' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "instance removal retained us in aggregate runtime"
+    grep -Fq 'chain-mtcp-jp' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "instance removal dropped the remaining jp route"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp-us-anchor.service" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-us-watchdog.service" && \
+       ! -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-us-watchdog.service" ]] || \
+        fail "instance removal retained us systemd artifacts"
+    [[ -f "$integration_dir/systemctl-state/gost-mtcp.service" && \
+       -f "$integration_dir/systemctl-state/gost-mtcp-jp-watchdog.service" ]] || \
+        fail "remaining route services did not restart after instance removal"
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-prewarm.lock" && \
+       ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-watchdog.lock" ]] || \
+        fail "instance removal retained route runtime locks"
+
     source_tree="$integration_dir/source-tree"
     mkdir -p "$source_tree/cn"
     cp cn/mtcp.conf "$source_tree/cn/mtcp.conf"
@@ -765,6 +852,48 @@ MOCK
         gost-ecmp-pathlock.service || fail "source-tree canonical template was treated as a live route"
     INSTALL_BASE="$old_install_base"
     unset PATHLOCK_SOURCE_TREE
+
+    source_cleanup="$integration_dir/source-cleanup"
+    mkdir -p "$source_cleanup"
+    cp install.sh standalone-install.sh "$source_cleanup/"
+    cp -R scripts cn remote "$source_cleanup/"
+    mkdir -p "$source_cleanup/cn/instances/demo/state"
+    : > "$source_cleanup/cn/gost"
+    : > "$source_cleanup/cn/runtime.yaml"
+    : > "$source_cleanup/cn/instances/demo/state/events.jsonl"
+    : > "$source_cleanup/remote/gost"
+    : > "$source_cleanup/remote/mtcp.auth"
+    printf '%s\n' '# modified installed script' > "$source_cleanup/cn/mtcp-lib.sh"
+    printf '%s\n' '# modified remote config' > "$source_cleanup/remote/remote.yaml"
+    INSTALL_BASE="$source_cleanup"
+    remove_pathlock_installed_data || fail "source-tree uninstall cleanup failed"
+    [[ ! -e "$source_cleanup/cn/instances" && ! -e "$source_cleanup/cn/gost" && \
+       ! -e "$source_cleanup/remote/gost" && ! -e "$source_cleanup/remote/mtcp.auth" ]] || \
+        fail "source-tree cleanup retained generated installation data"
+    cmp -s cn/cn.yaml "$source_cleanup/cn/cn.yaml" && \
+        cmp -s cn/mtcp-lib.sh "$source_cleanup/cn/mtcp-lib.sh" && \
+        cmp -s remote/remote.yaml "$source_cleanup/remote/remote.yaml" || \
+        fail "source-tree cleanup did not preserve and restore canonical sources"
+    [[ -f "$source_cleanup/install.sh" && -f "$source_cleanup/standalone-install.sh" ]] || \
+        fail "source-tree cleanup deleted installer sources"
+    INSTALL_BASE="$old_install_base"
+
+    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-prewarm.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-watchdog.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.state"
+    PROMPTS=(y); PROMPT_INDEX=0
+    remove_cn_instance jp >/dev/null
+    [[ ! -e "$jp" && ! -e "$INSTALL_BASE/cn/runtime.yaml" ]] || \
+        fail "last-instance removal retained jp data or aggregate runtime"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp.service" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-jp-anchor.service" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" && \
+       ! -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp.service" ]] || \
+        fail "last-instance removal retained CN systemd units"
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-prewarm.lock" && \
+       ! -e "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.state" ]] || \
+        fail "last-instance removal retained route or shared runtime state"
 
     PROMPTS=(45200); PROMPT_INDEX=0
     install_remote >/dev/null
@@ -789,8 +918,96 @@ MOCK
     remote_reinstall_rc=$?
     set -e
     (( remote_reinstall_rc != 0 )) || fail "active Remote reinstall was not refused"
+
+    PROMPTS=(cleanup 203.0.113.60 6760 45210 "" 25210 45211 40); PROMPT_INDEX=0
+    install_cn >/dev/null
+    [[ -e "$INSTALL_BASE/cn/instances/cleanup/cn.yaml" && \
+       -e "$SYSTEMD_DIR/gost-mtcp-cleanup-watchdog.service" ]] || \
+        fail "full-uninstall fixture did not install a CN route"
+
+    mkdir -p "$INSTALL_BASE/cn/state"
+    printf '%s\n' stale-log > "$INSTALL_BASE/cn/state/events.jsonl"
+    stale_project_unit="gost-ecmp-pathlock-stale-watchdog.service"
+    printf '%s\n' 'Description=GOST ECMP PathLock stale watchdog' > "$SYSTEMD_DIR/$stale_project_unit"
+    "$SYSTEMCTL_BIN" enable "$stale_project_unit"
+    "$SYSTEMCTL_BIN" restart "$stale_project_unit"
+    external_mtcp_unit="gost-mtcp-external.service"
+    printf '%s\n' 'Description=External MTCP Service' > "$SYSTEMD_DIR/$external_mtcp_unit"
+    "$SYSTEMCTL_BIN" enable "$external_mtcp_unit"
+    "$SYSTEMCTL_BIN" restart "$external_mtcp_unit"
+    cat > "$INSTALL_BASE/cn/mtcp.conf" <<EOF
+DST="192.0.2.99"
+UNIT="$external_mtcp_unit"
+ANCHOR_UNIT="external-anchor.service"
+WATCHDOG_UNIT="external-watchdog.service"
+EOF
+    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-stale-watchdog.lock"
+
+    unset PATHLOCK_UNINSTALL_CONFIRM
+    PROMPTS=("not confirmed"); PROMPT_INDEX=0
+    uninstall_pathlock >/dev/null 2>&1 || fail "cancelled full uninstall returned an error"
+    [[ -d "$INSTALL_BASE/remote" && -e "$SYSTEMD_DIR/gost-mtcp-remote.service" ]] || \
+        fail "cancelled full uninstall modified installed components"
+
+    set +e
+    ( export MOCK_FAIL_STOP=1 PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL
+      uninstall_pathlock >/dev/null 2>&1 )
+    uninstall_stop_failure_rc=$?
+    set -e
+    (( uninstall_stop_failure_rc != 0 )) || fail "full uninstall ignored a service stop failure"
+    [[ -d "$INSTALL_BASE/remote" && -e "$SYSTEMD_DIR/gost-mtcp-remote.service" ]] || \
+        fail "failed service stop allowed full uninstall to delete data or units"
+
+    set +e
+    ( INSTALL_BASE=/opt PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL
+      uninstall_pathlock >/dev/null 2>&1 )
+    unsafe_uninstall_rc=$?
+    set -e
+    (( unsafe_uninstall_rc != 0 )) || fail "full uninstall accepted an unsafe INSTALL_BASE"
+    [[ -e "$SYSTEMD_DIR/gost-mtcp-remote.service" ]] || \
+        fail "unsafe INSTALL_BASE validation ran after systemd deletion"
+
+    ln -s "$INSTALL_BASE" "$integration_dir/install-link"
+    set +e
+    ( INSTALL_BASE="$integration_dir/install-link" PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL
+      uninstall_pathlock >/dev/null 2>&1 )
+    symlink_uninstall_rc=$?
+    set -e
+    rm -f "$integration_dir/install-link"
+    (( symlink_uninstall_rc != 0 )) || fail "full uninstall accepted a symlinked INSTALL_BASE"
+    [[ -e "$SYSTEMD_DIR/gost-mtcp-remote.service" ]] || \
+        fail "symlinked INSTALL_BASE validation ran after systemd deletion"
+
+    ln -s "$SYSTEMD_DIR" "$integration_dir/systemd-link"
+    set +e
+    ( SYSTEMD_DIR="$integration_dir/systemd-link" PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL
+      uninstall_pathlock >/dev/null 2>&1 )
+    symlink_systemd_rc=$?
+    set -e
+    rm -f "$integration_dir/systemd-link"
+    (( symlink_systemd_rc != 0 )) || fail "full uninstall accepted a symlinked SYSTEMD_DIR"
+    [[ -e "$SYSTEMD_DIR/gost-mtcp-remote.service" ]] || \
+        fail "symlinked SYSTEMD_DIR validation ran after systemd deletion"
+
+    PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL uninstall_pathlock >/dev/null
+    [[ ! -e "$INSTALL_BASE/cn" && ! -e "$INSTALL_BASE/remote" ]] || \
+        fail "full uninstall retained configs, credentials, state, or logs"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp-remote.service" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service" && \
+       ! -e "$SYSTEMD_DIR/$stale_project_unit" ]] || \
+        fail "full uninstall retained PathLock systemd units"
+    ! compgen -G "$SYSTEMD_DIR/gost-ecmp-pathlock*.service" >/dev/null || \
+        fail "full uninstall retained legacy PathLock systemd units"
+    [[ -e "$SYSTEMD_DIR/$external_mtcp_unit" && \
+       -e "$integration_dir/systemctl-state/$external_mtcp_unit" ]] || \
+        fail "full uninstall deleted an unrelated gost-mtcp-prefixed service"
+    collect_project_systemd_units
+    (( ${#PROJECT_SYSTEMD_UNITS[@]} == 0 )) || \
+        fail "full uninstall still discovers project-owned systemd units"
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-stale-watchdog.lock" ]] || \
+        fail "full uninstall retained runtime lock files"
 )
-pass "standalone CLI handles CN/Remote dashboards, input retry, Ctrl-C logs, isolation, and rollback"
+pass "standalone CLI handles install, route removal, full uninstall, isolation, and rollback"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/mtcp-tests.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT

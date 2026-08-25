@@ -121,10 +121,12 @@ bash /root/standalone-install.sh
 [2]  查看线路与端口
 [3]  管理端口转发
 [4]  运行状态 / 日志
+[5]  删除 CN 线路实例
+[6]  完全卸载 PathLock
 [Q]  退出
 ```
 
-交互菜单会显示 CN/Remote 服务、线路状态和 endpoint 摘要；操作完成后按 Enter 返回，输入错误只中止当前操作，不会退出整个管理器。无效菜单项会直接重新提示；实时日志中的 `Ctrl-C` 只停止跟踪并返回状态菜单。颜色仅在交互 TTY 中启用，设置 `NO_COLOR=1` 可强制关闭。安装后继续运行同一条 `bash /root/standalone-install.sh` 即可管理，不需要设置 `CN_INSTANCE`。自动化场景仍可使用 `bash standalone-install.sh remote|cn|relay`，其退出码与 fatal error 行为不变。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的，安装器会自动去掉它寻找对应资产文件。
+交互菜单会显示 CN/Remote 服务、线路状态和 endpoint 摘要；操作完成后按 Enter 返回，输入错误只中止当前操作，不会退出整个管理器。无效菜单项会直接重新提示；实时日志中的 `Ctrl-C` 只停止跟踪并返回状态菜单。颜色仅在交互 TTY 中启用，设置 `NO_COLOR=1` 可强制关闭。安装后继续运行同一条 `bash /root/standalone-install.sh` 即可管理，不需要设置 `CN_INSTANCE`。自动化场景仍可使用 `bash standalone-install.sh remote|cn|relay|instance|uninstall`，其退出码与 fatal error 行为不变。`GOST_VERSION=v3.2.6` 里的 `v` 只是 Release tag 用的，安装器会自动去掉它寻找对应资产文件。
 
 **传统方式(开发/调试用, 能看到完整代码)**
 
@@ -361,6 +363,26 @@ INSTALL_BASE=/root/mtcpjpv22 bash standalone-install.sh relay
 只有一条线路时直接命令会自动识别；多条线路并存时菜单会列出别名、Remote endpoint、业务端口和当前状态，按编号选择即可。`CN_INSTANCE`、`CN_YAML_PATH` 和 `CN_MTCP_CONFIG_PATH` 仅保留给无人值守脚本使用。
 
 旧版 `$INSTALL_BASE/cn/cn.yaml` 平铺布局会在首次重装线路时迁移并归档。共享 `runtime.yaml` 始终由编译器生成，不能直接手改。
+
+### 删除线路实例与完全卸载
+
+主菜单的 `[5]` 可以永久删除一个新版 `cn/instances/<线路>` 实例，也可以直接执行：
+
+```bash
+bash standalone-install.sh instance remove jp
+```
+
+删除前会展示 Remote、业务端口、实例目录、活跃连接数和剩余线路数，并要求再次确认。操作会删除该实例的 fragment、鉴权文件、状态、JSONL 日志、Anchor/Watchdog unit 和 `/run` 锁文件。还有其他线路时，安装器会先生成并校验不含目标实例的新 `runtime.yaml`，再重启共享 GOST，让剩余线路重新建连；提交或重启失败会恢复实例、聚合配置与 units。删除最后一条线路时，会一并停止、disable 并删除共享 `gost-mtcp.service`。
+
+主菜单的 `[6]` 用于完全卸载，也可直接执行：
+
+```bash
+bash standalone-install.sh uninstall
+# 自动化环境必须显式确认
+PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL bash standalone-install.sh uninstall
+```
+
+完全卸载会先列出并确认所有项目服务已经停止，再删除 standalone 与传统安装方式产生的 PathLock systemd units、enable 链接、CN/Remote 运行组件、配置、凭据、状态、JSONL 日志及 `/run` 锁文件。单元识别同时依据已安装配置、项目专用名称和 unit 的 PathLock 标记，不会仅因其他服务名称以 `gost-mtcp` 开头就删除。若 `INSTALL_BASE` 是源码仓库，只清除安装产物并恢复 canonical 模板，不删除仓库和安装脚本；普通 `/opt/gost-mtcp` 部署会删除整个 `cn/`、`remote/` 运行目录。源码方式管理时需和安装时一样指定仓库的规范绝对路径，例如 `INSTALL_BASE=/root/gost-ecmp-pathlock bash standalone-install.sh uninstall`；为防止路径穿越，实例删除和完全卸载都会拒绝根目录、过宽目录、符号链接、`..` 和带尾斜杠的 `INSTALL_BASE`，并要求 `SYSTEMD_DIR` 同样是无符号链接的规范绝对路径。systemd journal 使用全机共享文件，安装器不会为了删除某个项目的历史记录而执行会波及其他服务的全局 vacuum；用户自行配置的防火墙规则以及系统级 `socat` 等软件包也不会被修改。
 
 ## 重要注意事项
 
