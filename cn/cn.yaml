@@ -10,7 +10,8 @@ services:
   forwarder:
     nodes:
     - name: backend
-      addr: 127.0.0.1:2345
+      # 安装时必须由用户指定端口；后端地址默认使用 Remote 本机 127.0.0.1。
+      addr: backend.example.invalid:1
 
 # 专用 MTCP 锚定入口，仅监听本机。
 # Anchor 会主动发送 1 Byte 触发默认 Relay 首包逻辑，因此共享 connector 保持原始默认行为。

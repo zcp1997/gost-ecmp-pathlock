@@ -51,8 +51,9 @@ Standalone：
   bash install.sh cn
 
 Remote 默认监听 6600/tcp，并强制设置 12-128 位 MTCP Relay 鉴权密码。
-CN 安装时会询问同一鉴权密码和 RTT 快路准入阈值，RTT 默认 40ms，可自定义。
-鉴权凭据保存在权限为 0600 的 mtcp.auth 文件中，不写入 YAML。
+CN 安装时会询问同一鉴权密码、主业务入口的 Remote 后端地址/端口和 RTT 快路准入阈值。
+后端地址直接回车默认 127.0.0.1，后端端口必须明确设置；不会再自动指向 127.0.0.1:2345。
+RTT 默认 40ms，可自定义。鉴权凭据保存在权限为 0600 的 mtcp.auth 文件中，不写入 YAML。
 CN 全机只启动一个共享 gost-mtcp.service；每条线路保留独立的轻量 Watchdog 与 Anchor。
 新增线路或 Relay 会重建 runtime.yaml 并短暂重启共享 GOST，因此影响所有线路。
 检测到活跃业务时，菜单会显示连接数并要求再次确认；直接命令需使用 CN_FORCE_RESTART=1。

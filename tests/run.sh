@@ -72,6 +72,10 @@ pass "standalone embedded payload matches canonical files"
 grep -Fqx '    auther: mtcp-auth' remote/remote.yaml || fail "Remote Relay authenticator is missing"
 grep -Fqx '          file: /root/gost-ecmp-pathlock/cn/instances/default/mtcp.auth' cn/cn.yaml || \
     fail "CN Relay connector auth is missing"
+grep -Fqx '      addr: backend.example.invalid:1' cn/cn.yaml || \
+    fail "canonical CN template does not use a non-routable backend placeholder"
+! grep -Fq '127.0.0.1:2345' cn/cn.yaml || \
+    fail "canonical CN template still silently targets the old default backend"
 grep -Fq 'bash "$PROJECT_ROOT/standalone-install.sh" cn' install.sh || \
     fail "traditional installer does not delegate to the shared CN implementation"
 ! grep -Eq '^[[:space:]]*password:' remote/remote.yaml cn/cn.yaml || fail "plaintext password embedded in YAML"
@@ -120,18 +124,38 @@ pass "standalone supports the management menu plus file and piped execution"
 #!/usr/bin/env bash
 set -u
 state_dir='$integration_dir/systemctl-state'
+systemd_dir='$integration_dir/systemd'
+wants_dir="\$systemd_dir/multi-user.target.wants"
 command_name="\${1:-}"; shift || true
 case "\$command_name" in
   is-active)
     [[ "\${1:-}" == --quiet ]] && shift
-    [[ -f "\$state_dir/\${1:-missing}" ]]
+    unit="\${1:-missing}"
+    [[ "\${MOCK_FAIL_IS_ACTIVE:-0}" != 1 ]] || exit 1
+    [[ ! -f "\$state_dir/\$unit" ]] || exit 0
+    [[ -e "\$systemd_dir/\$unit" || -L "\$systemd_dir/\$unit" ]] && exit 3
+    exit 4
     ;;
   enable)
+    mkdir -p "\$wants_dir"
+    for unit in "\$@"; do
+      [[ "\$unit" == -* ]] && continue
+      ln -sfn "\$systemd_dir/\$unit" "\$wants_dir/\$unit"
+    done
     [[ "\${MOCK_FAIL_ENABLE:-0}" != 1 ]]
+    ;;
+  disable)
+    for unit in "\$@"; do
+      [[ "\$unit" == -* ]] && continue
+      rm -f "\$wants_dir/\$unit"
+    done
     ;;
   restart)
     [[ "\${MOCK_FAIL_RESTART:-0}" == 1 ]] && exit 1
-    for unit in "\$@"; do touch "\$state_dir/\$unit"; done
+    for unit in "\$@"; do
+      touch "\$state_dir/\$unit"
+      [[ "\${MOCK_FAIL_RESTART_UNIT:-}" != "\$unit" ]] || exit 1
+    done
     ;;
   stop)
     [[ "\${MOCK_FAIL_STOP:-0}" == 1 ]] && exit 1
@@ -240,6 +264,28 @@ MOCK
     set -e
     (( automation_invalid_port_rc != 0 )) || fail "automation mode stopped failing fast on invalid input"
 
+    PROMPTS=("bad host" "" not-a-port 24567); PROMPT_INDEX=0
+    backend_prompt_output="$integration_dir/backend-prompt.out"
+    prompt_backend_addr prompted_backend "测试后端" >"$backend_prompt_output" 2>&1 || \
+        fail "backend prompt did not retry invalid host or port"
+    [[ "$prompted_backend" == "127.0.0.1:24567" && "$PROMPT_INDEX" == 4 ]] || \
+        fail "backend prompt did not apply the localhost default and explicit port"
+    grep -q '后端地址无效' "$backend_prompt_output" && \
+        grep -q '端口必须是 1-65535' "$backend_prompt_output" || \
+        fail "backend prompt did not explain invalid input"
+    PROMPTS=(2001:db8::1 8443); PROMPT_INDEX=0
+    prompt_backend_addr prompted_backend "测试后端" >/dev/null 2>&1 || \
+        fail "backend prompt rejected an IPv6 host"
+    [[ "$prompted_backend" == "[2001:db8::1]:8443" ]] || \
+        fail "backend prompt did not bracket an IPv6 host"
+    set +e
+    ( PATHLOCK_INTERACTIVE_MENU=0; PROMPTS=("bad host"); PROMPT_INDEX=0
+      prompt_backend_addr ignored "测试后端" ) >/dev/null 2>&1
+    automation_invalid_backend_rc=$?
+    set -e
+    (( automation_invalid_backend_rc != 0 )) || \
+        fail "automation mode did not fail fast on an invalid backend host"
+
     ui_failure_tmp="$integration_dir/ui-failure.tmp"
     ui_test_failure() {
         : > "$ui_failure_tmp"
@@ -279,6 +325,27 @@ MOCK
     PATHLOCK_INTERACTIVE_MENU=0
 
     mkdir -p "$INSTALL_BASE/cn"
+
+    # 首次安装在 enable 之后失败时，artifact rollback 还必须撤销新 unit 的
+    # Wants symlink；仅删除 unit 文件会留下 broken enable 状态。
+    first_main_link="$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp.service"
+    first_watchdog_link="$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-firstfail-watchdog.service"
+    set +e
+    ( export MOCK_FAIL_RESTART=1
+      PROMPTS=(firstfail 192.0.2.50 6650 45090 "" 25090 45091 40); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    first_install_failure_rc=$?
+    set -e
+    (( first_install_failure_rc != 0 )) || fail "first-install restart failure simulation unexpectedly succeeded"
+    [[ ! -e "$first_main_link" && ! -L "$first_main_link" ]] || \
+        fail "failed first install left gost-mtcp.service enabled"
+    [[ ! -e "$first_watchdog_link" && ! -L "$first_watchdog_link" ]] || \
+        fail "failed first install left its new Watchdog enabled"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp.service" ]] || \
+        fail "failed first install left the shared main unit file"
+    [[ ! -e "$SYSTEMD_DIR/gost-mtcp-firstfail-watchdog.service" ]] || \
+        fail "failed first install left the new Watchdog unit file"
+
     cat > "$INSTALL_BASE/cn/mtcp.conf" <<'LEGACY'
 UNIT="gost-mtcp-jp.service"
 BUSINESS_PORT="45100"
@@ -307,7 +374,7 @@ LEGACY
       }
       { print }
     ' cn/cn.yaml > "$INSTALL_BASE/cn/cn.yaml"
-    PROMPTS=(jp 45.142.125.253 5201 45100 45101 40); PROMPT_INDEX=0
+    PROMPTS=(jp 45.142.125.253 5201 45100 "" 24500 45101 40); PROMPT_INDEX=0
     install_cn >/dev/null
     grep -q 'name: relay-45104' "$INSTALL_BASE/cn/instances/jp/cn.yaml" || \
         fail "legacy Relay was not preserved during migration"
@@ -317,7 +384,7 @@ LEGACY
     resolve_cn_relay_context
     [[ "$CN_RELAY_YAML" == "$INSTALL_BASE/cn/instances/jp/cn.yaml" ]] || \
         fail "Relay resolver preferred legacy flat config after migration"
-    PROMPTS=(us 198.51.100.20 6600 45102 45103 45); PROMPT_INDEX=0
+    PROMPTS=(us 198.51.100.20 6600 45102 10.0.0.20 24502 45103 45); PROMPT_INDEX=0
     install_cn >/dev/null
 
     jp="$INSTALL_BASE/cn/instances/jp"
@@ -343,6 +410,12 @@ LEGACY
     grep -Fq -- '- name: chain-mtcp-us' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses us chain"
     grep -Fq -- '- name: tcp-entry-jp' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses jp service"
     grep -Fq -- '- name: tcp-entry-us' "$INSTALL_BASE/cn/runtime.yaml" || fail "aggregate misses us service"
+    grep -Fqx '      addr: 127.0.0.1:24500' "$jp/cn.yaml" || \
+        fail "jp primary forwarding did not use the default backend host and configured port"
+    grep -Fqx '      addr: 10.0.0.20:24502' "$us/cn.yaml" || \
+        fail "us primary forwarding did not use the configured backend host and port"
+    ! grep -Fq 'backend.example.invalid' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "aggregate retained the canonical backend placeholder"
     grep -Fqx "ExecStart=$INSTALL_BASE/cn/mtcp-watchdog.sh $jp/mtcp.conf" \
         "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" || fail "watchdog unit does not use isolated state config"
 
@@ -351,7 +424,7 @@ LEGACY
     rm -f "$us/mtcp.conf.bak"
     set +e
     policy_failure_output="$(
-      PROMPTS=(policyfail 203.0.113.33 6703 45126 45127 45); PROMPT_INDEX=0
+      PROMPTS=(policyfail 203.0.113.33 6703 45126 "" 25126 45127 45); PROMPT_INDEX=0
       install_cn 2>&1
     )"
     policy_failure_rc=$?
@@ -374,7 +447,7 @@ LEGACY
 
     set +e
     ( export MOCK_GOST_VERSION=invalid
-      PROMPTS=(validationfail 203.0.113.30 6700 45120 45121 45); PROMPT_INDEX=0
+      PROMPTS=(validationfail 203.0.113.30 6700 45120 "" 25120 45121 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
     validation_failure_rc=$?
     set -e
@@ -396,10 +469,17 @@ ANCHOR_UNIT="removed-anchor.service"
 STALE
     ( export MOCK_FAIL_STOP=1; stop_cn_route_controls "$stale_controls" 1 ) || \
         fail "already-inactive stale control units blocked the shared transaction"
+    set +e
+    ( export MOCK_FAIL_STOP=1 MOCK_FAIL_IS_ACTIVE=1
+      stop_cn_route_controls "$stale_controls" 1 ) >/dev/null 2>&1
+    control_query_failure_rc=$?
+    set -e
+    (( control_query_failure_rc != 0 )) || \
+        fail "strict control stop treated a systemd status query error as inactive"
 
     set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_STOP=1
-      PROMPTS=(stopfail 203.0.113.32 6702 45124 45125 45); PROMPT_INDEX=0
+      PROMPTS=(stopfail 203.0.113.32 6702 45124 "" 25124 45125 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
     shared_stop_failure_rc=$?
     set -e
@@ -415,7 +495,7 @@ STALE
 
     set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_DAEMON_RELOAD=1
-      PROMPTS=(reloadfail 203.0.113.34 6704 45128 45129 45); PROMPT_INDEX=0
+      PROMPTS=(reloadfail 203.0.113.34 6704 45128 "" 25128 45129 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
     shared_reload_failure_rc=$?
     set -e
@@ -431,7 +511,7 @@ STALE
 
     set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_ENABLE=1
-      PROMPTS=(enablefail 203.0.113.35 6705 45130 45131 45); PROMPT_INDEX=0
+      PROMPTS=(enablefail 203.0.113.35 6705 45130 "" 25130 45131 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
     shared_enable_failure_rc=$?
     set -e
@@ -445,9 +525,33 @@ STALE
     ! grep -Fq 'chain-mtcp-enablefail' "$INSTALL_BASE/cn/runtime.yaml" || \
         fail "systemd enable failure leaked into aggregate runtime"
 
+    watchfail_unit="gost-mtcp-watchfail-watchdog.service"
+    watchfail_link="$SYSTEMD_DIR/multi-user.target.wants/$watchfail_unit"
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_RESTART_UNIT="$watchfail_unit"
+      PROMPTS=(watchfail 203.0.113.36 6706 45132 "" 25132 45133 45); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    watchdog_restart_failure_rc=$?
+    set -e
+    (( watchdog_restart_failure_rc != 0 )) || fail "new Watchdog restart failure simulation unexpectedly succeeded"
+    [[ ! -e "$watchfail_link" && ! -L "$watchfail_link" ]] || \
+        fail "failed CN transaction left its new Watchdog enabled"
+    [[ ! -e "$SYSTEMD_DIR/$watchfail_unit" ]] || \
+        fail "failed CN transaction left its new Watchdog unit file"
+    [[ ! -e "$INSTALL_BASE/cn/instances/watchfail/mtcp.conf" ]] || \
+        fail "failed CN transaction left its new route config"
+    ! grep -Fq 'chain-mtcp-watchfail' "$INSTALL_BASE/cn/runtime.yaml" || \
+        fail "new Watchdog restart failure leaked into aggregate runtime"
+    for shared_script in "${shared_scripts[@]}"; do
+        grep -Fqx "$shared_marker" "$INSTALL_BASE/cn/$shared_script" || \
+            fail "$shared_script was not restored after new Watchdog restart failure"
+    done
+    grep -Fq '# mock-gost-v1' "$INSTALL_BASE/cn/gost" || \
+        fail "GOST binary was not restored after new Watchdog restart failure"
+
     set +e
     ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_RESTART=1
-      PROMPTS=(restartfail 203.0.113.31 6701 45122 45123 45); PROMPT_INDEX=0
+      PROMPTS=(restartfail 203.0.113.31 6701 45122 "" 25122 45123 45); PROMPT_INDEX=0
       install_cn >/dev/null 2>&1 )
     shared_restart_failure_rc=$?
     set -e
@@ -463,8 +567,9 @@ STALE
 
     config_listing="$(list_installed_configurations)"
     [[ "$config_listing" == *"线路 jp"* && "$config_listing" == *"线路 us"* && \
-       "$config_listing" == *"端口路径"* && "$config_listing" == *"127.0.0.1:2345"* ]] || \
-        fail "management menu did not list routes and port paths"
+       "$config_listing" == *"端口路径"* && "$config_listing" == *"127.0.0.1:24500"* && \
+       "$config_listing" == *"10.0.0.20:24502"* && "$config_listing" != *"127.0.0.1:2345"* ]] || \
+        fail "management menu did not list user-configured routes and port paths"
     PROMPTS=(02); PROMPT_INDEX=0
     selected_yaml=""; selected_config=""
     route_selector_output="$integration_dir/route-selector.out"
@@ -526,7 +631,7 @@ MOCK
     PATHLOCK_INTERACTIVE_MENU=0
 
     set +e
-    ( PROMPTS=(duplicate 45.142.125.253 5201 45110 45111 40); PROMPT_INDEX=0; install_cn >/dev/null 2>&1 )
+    ( PROMPTS=(duplicate 45.142.125.253 5201 45110 "" 25110 45111 40); PROMPT_INDEX=0; install_cn >/dev/null 2>&1 )
     duplicate_endpoint_rc=$?
     set -e
     (( duplicate_endpoint_rc != 0 )) || fail "duplicate Remote endpoint was accepted in shared GOST"
@@ -556,7 +661,7 @@ MOCK
     CN_COMPILE_SCRIPT="$CN_ROOT/compile-config.sh"
 
     set +e
-    ( PROMPTS=(45108 127.0.0.1:2351 tcp-entry); PROMPT_INDEX=0
+    ( PROMPTS=(45108 "" 2351 tcp-entry); PROMPT_INDEX=0
       add_cn_relay >/dev/null 2>&1 )
     reserved_relay_name_rc=$?
     set -e

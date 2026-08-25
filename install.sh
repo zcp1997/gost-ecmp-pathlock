@@ -169,8 +169,9 @@ show_next_steps() {
 接下来将依次询问：
   1. Remote 节点/线路别名，例如 de、us
   2. Remote IPv4 地址、MTCP 端口及 Remote 安装时设置的鉴权密码
-  3. CN 业务监听端口和 Anchor 监听端口
-  4. RTT 快路准入阈值，默认 40ms，可自定义
+  3. CN 业务监听端口，以及 Remote 业务后端地址和端口（地址默认 127.0.0.1）
+  4. CN Anchor 监听端口
+  5. RTT 快路准入阈值，默认 40ms，可自定义
 
 CN 全机只运行一个共享 GOST 主服务；每条线路保留独立 Watchdog，Anchor 仍只由 Watchdog 控制。
 GOST 默认通过 https://ghfast.top/https://github.com/... 下载，并继续校验官方 checksums.txt。

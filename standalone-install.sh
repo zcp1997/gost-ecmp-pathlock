@@ -546,6 +546,44 @@ normalize_ipv4() {
         "$((10#${octets[2]}))" "$((10#${octets[3]}))"
 }
 
+normalize_backend_host() {
+    local value="$1"
+
+    if valid_ipv4 "$value"; then
+        normalize_ipv4 "$value"
+    elif [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        printf '%s\n' "$value"
+    elif [[ "$value" =~ ^\[[0-9A-Fa-f:]+\]$ ]]; then
+        printf '%s\n' "$value"
+    elif [[ "$value" == *:* && "$value" =~ ^[0-9A-Fa-f:]+$ ]]; then
+        printf '[%s]\n' "$value"
+    else
+        return 1
+    fi
+}
+
+prompt_backend_addr() {
+    local output_var="$1" label="${2:-Remote 后端}"
+    local host normalized_host target_port rendered
+
+    while :; do
+        prompt_read host "${label}地址 [127.0.0.1]: " || return 1
+        host="${host:-127.0.0.1}"
+        if normalized_host="$(normalize_backend_host "$host")"; then
+            break
+        fi
+        if (( PATHLOCK_INTERACTIVE_MENU == 0 )); then
+            die "后端地址无效，请使用 IPv4、主机名或 IPv6 地址"
+        fi
+        ui_error "后端地址无效，请使用 IPv4、主机名或 IPv6 地址"
+    done
+
+    ui_prompt_port target_port "${label}端口: " || return 1
+    rendered="${normalized_host}:${target_port}"
+    validate_backend_addr "$rendered" || return 1
+    printf -v "$output_var" '%s' "$rendered"
+}
+
 ensure_units_inactive() {
     local label="$1" unit
     shift
@@ -597,10 +635,10 @@ ensure_cn_port_available() {
 
 render_cn_route_yaml() {
     local source="$1" destination="$2" route="$3" remote_addr="$4"
-    local business_addr="$5" anchor_addr="$6" auth_file="$7"
+    local business_addr="$5" business_backend="$6" anchor_addr="$7" auth_file="$8"
 
     awk -v route="$route" -v remote_addr="$remote_addr" -v business_addr="$business_addr" \
-        -v anchor_addr="$anchor_addr" -v auth_file="$auth_file" '
+        -v business_backend="$business_backend" -v anchor_addr="$anchor_addr" -v auth_file="$auth_file" '
         function yaml_quote(value) {
             gsub(/\047/, "\047\047", value)
             return "\047" value "\047"
@@ -658,7 +696,11 @@ render_cn_route_yaml() {
                     line="  addr: " anchor_addr
                     anchor_addr_seen++
                 }
-                current_service=""
+            }
+            if (section == "services" && current_service == "primary" &&
+                line ~ /^      addr:[[:space:]]*/) {
+                line="      addr: " business_backend
+                primary_backend_seen++
             }
             if (section == "services" && (line ~ /^    chain:[[:space:]]*chain-mtcp[[:space:]]*$/ ||
                 line ~ /^    chain:[[:space:]]*chain-mtcp-default[[:space:]]*$/ ||
@@ -713,8 +755,9 @@ render_cn_route_yaml() {
         }
         END {
             if (primary_seen != 1 || anchor_seen != 1 || primary_addr_seen != 1 ||
-                anchor_addr_seen != 1 || chain_seen != 1 || remote_node_seen != 1 ||
-                remote_addr_seen != 1 || connector_seen != 1 || auth_seen != 1) exit 42
+                primary_backend_seen != 1 || anchor_addr_seen != 1 || chain_seen != 1 ||
+                remote_node_seen != 1 || remote_addr_seen != 1 || connector_seen != 1 ||
+                auth_seen != 1) exit 42
         }
     ' "$source" > "$destination"
 }
@@ -810,7 +853,7 @@ validate_cn_process_policy_consistency() {
 }
 
 stop_cn_route_controls() {
-    local cn_dir="$1" strict="${2:-0}" config anchor watchdog unit stop_rc failed=0
+    local cn_dir="$1" strict="${2:-0}" config anchor watchdog unit stop_rc active_rc failed=0
     for config in "$cn_dir"/instances/*/mtcp.conf; do
         [[ -r "$config" ]] || continue
         anchor="$(read_config_value "$config" ANCHOR_UNIT 2>/dev/null || true)"
@@ -819,14 +862,26 @@ stop_cn_route_controls() {
             [[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
             stop_rc=0
             "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || stop_rc=$?
-            # `systemctl stop` 对不存在的旧 unit 会非零退出，但它已满足“未运行”。
-            # 严格事务只应拒绝停止后仍 active 的控制单元。
-            if "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1; then
-                if (( strict == 1 )); then
-                    echo "控制单元停止后仍在运行: $unit（systemctl stop exit $stop_rc）" >&2
-                    failed=1
-                fi
-            fi
+            active_rc=0
+            "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1 || active_rc=$?
+            case "$active_rc" in
+                0)
+                    if (( strict == 1 )); then
+                        echo "控制单元停止后仍在运行: $unit（systemctl stop exit $stop_rc）" >&2
+                        failed=1
+                    fi
+                    ;;
+                3|4)
+                    # inactive/failed 或 unit 不存在，都已满足“未运行”。
+                    ;;
+                *)
+                    # D-Bus/systemd 查询异常不能被当作 inactive；严格事务必须 fail closed。
+                    if (( strict == 1 )); then
+                        echo "无法确认控制单元状态: $unit（systemctl is-active exit $active_rc，stop exit $stop_rc）" >&2
+                        failed=1
+                    fi
+                    ;;
+            esac
         done
     done
     (( failed == 0 ))
@@ -1002,7 +1057,8 @@ install_cn() {
     check_command ss; check_command flock; check_command timeout
 
     local cn_dir="$INSTALL_BASE/cn" runtime_yaml main_unit="gost-mtcp.service"
-    local remote_alias remote_ip remote_port business_port anchor_port rtt_threshold auth_password
+    local remote_alias remote_ip remote_port business_port business_backend anchor_port
+    local rtt_threshold auth_password
     local route_prefix anchor_unit watchdog_unit legacy_main_unit instance_dir state_dir auth_file
     local anchor_service chain_name
     local yaml_template yaml_tmp conf_tmp auth_tmp runtime_tmp runtime_stage compile_tmp
@@ -1067,6 +1123,7 @@ install_cn() {
     ui_prompt_port remote_port "Remote MTCP 端口 [6600]: " 6600 || die "未输入 Remote MTCP 端口"
     get_mtcp_auth_password auth_password "请输入 Remote 安装时设置的 MTCP 鉴权密码"
     ui_prompt_port business_port "CN 业务监听端口 [12000]: " 12000 || die "未输入 CN 业务监听端口"
+    prompt_backend_addr business_backend "Remote 后端" || die "未输入 Remote 后端地址或端口"
     while :; do
         ui_prompt_port anchor_port "CN Anchor 监听端口 [12001]: " 12001 || die "未输入 CN Anchor 监听端口"
         [[ "$business_port" != "$anchor_port" ]] && break
@@ -1139,8 +1196,9 @@ install_cn() {
     fi
 
     render_cn_route_yaml "$yaml_template" "$yaml_tmp" "$remote_alias" \
-        "$remote_ip:$remote_port" ":$business_port" "127.0.0.1:$anchor_port" "$auth_file" || \
-        die "CN 线路 fragment 的监听、链或鉴权结构不符合预期"
+        "$remote_ip:$remote_port" ":$business_port" "$business_backend" \
+        "127.0.0.1:$anchor_port" "$auth_file" || \
+        die "CN 线路 fragment 的监听、后端、链或鉴权结构不符合预期"
 
     business_ports="$(cn_business_ports "$yaml_tmp" "$chain_name" "$anchor_service")"
     [[ " $business_ports " == *" $business_port "* ]] || \
@@ -1224,6 +1282,16 @@ install_cn() {
             rm -f "$path"
         fi
     }
+    disable_new_cn_units() {
+        # enable 的状态不在 artifact 备份中。若 unit 原本不存在，失败事务必须
+        # 在删除候选 unit 前撤销可能已创建（即使 enable 最终返回失败）的 Wants symlink。
+        if [[ ! -e "$backup_dir/main-unit.exists" ]]; then
+            "$SYSTEMCTL_BIN" disable "$main_unit" >/dev/null 2>&1 || true
+        fi
+        if [[ ! -e "$backup_dir/watchdog-unit.exists" ]]; then
+            "$SYSTEMCTL_BIN" disable "$watchdog_unit" >/dev/null 2>&1 || true
+        fi
+    }
     backup_one "$cn_dir/gost" shared-gost
     backup_one "$cn_dir/mtcp-lib.sh" shared-lib
     backup_one "$cn_dir/mtcp-prewarm.sh" shared-prewarm
@@ -1284,6 +1352,7 @@ install_cn() {
     if (( restart_ok != 1 )); then
         echo "共享 GOST 更新失败，正在回滚 binary、公共脚本、线路、聚合配置和 systemd unit。" >&2
         stop_cn_route_controls "$cn_dir"
+        disable_new_cn_units
         restore_one "$cn_dir/gost" shared-gost
         restore_one "$cn_dir/mtcp-lib.sh" shared-lib
         restore_one "$cn_dir/mtcp-prewarm.sh" shared-prewarm
@@ -1325,7 +1394,8 @@ install_cn() {
   CN 线路安装完成（共享单 GOST 进程）
 ============================================================
 线路: $remote_alias    Remote: $remote_ip:$remote_port    MTCP 鉴权: 已启用
-业务端口: $business_port    RTT 阈值: ${rtt_threshold}ms
+默认端口转发: :$business_port -> $business_backend
+RTT 阈值: ${rtt_threshold}ms
 线路 fragment: $instance_dir/cn.yaml
 共享运行配置: $runtime_yaml
 鉴权文件: ${auth_file}（权限 0600）
@@ -1817,11 +1887,7 @@ add_cn_relay() {
     [[ "$listen_port" != "$CN_PRIMARY_PORT" ]] || die "$listen_port 是受保护的主业务端口"
     [[ "$listen_port" != "$CN_ANCHOR_PORT" ]] || die "$listen_port 是受保护的 Anchor 端口"
 
-    while :; do
-        prompt_read backend "Remote 后端地址（例如 127.0.0.1:2347）: " || die "未输入后端地址"
-        validate_backend_addr "$backend" && break
-        echo "后端地址格式无效，请使用 host:port 或 [IPv6]:port。" >&2
-    done
+    prompt_backend_addr backend "Remote 后端" || die "未输入 Remote 后端地址或端口"
     default_name="relay-$CN_ROUTE_ID-$listen_port"
     while :; do
         prompt_read service_name "Relay 服务名 [$default_name]: " || die "未输入服务名"
@@ -2268,7 +2334,8 @@ services:
   forwarder:
     nodes:
     - name: backend
-      addr: 127.0.0.1:2345
+      # 安装时必须由用户指定端口；后端地址默认使用 Remote 本机 127.0.0.1。
+      addr: backend.example.invalid:1
 
 # 专用 MTCP 锚定入口，仅监听本机。
 # Anchor 会主动发送 1 Byte 触发默认 Relay 首包逻辑，因此共享 connector 保持原始默认行为。

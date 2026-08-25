@@ -89,7 +89,7 @@ Valid samples: 970 / 1000
                                                 | manages / observes                                           v
                              +------------------------------------+                           +--------------------------------+
                              | CN recovery control                |                           | requested stream targets       |
-                             | Prewarm : draw ECMP by minrtt      |                           | business :2345/:2347/...       |
+                             | Prewarm : draw ECMP by minrtt      |                           | configured business backends   |
                              | Anchor  : hold logical stream      |                           | probe echo :12346              |
                              | Watchdog: PID/outer/RTT/Remote     |                           +--------------------------------+
                              | Probe   : 1-byte payload echo      |
@@ -206,7 +206,9 @@ ss -tin state established 'dst <REMOTE_IP> dport = :6600'
 
 ## 常见配置
 
-**修改 CN 后端地址** —— CN 的 `forwarder.nodes[0].addr` 就是 Remote 最终要连的那个 TCP 目标:
+安装 CN 线路时，向导会要求配置主业务入口对应的 Remote 后端端口，并单独询问后端地址；地址直接回车默认使用 Remote 本机 `127.0.0.1`。安装器不会再静默生成指向 `127.0.0.1:2345` 的转发。
+
+**修改已有 CN 后端地址** —— CN 的 `forwarder.nodes[0].addr` 就是 Remote 最终要连的那个 TCP 目标:
 
 ```bash
 # 单文件安装器默认路径
@@ -343,11 +345,12 @@ bash standalone-install.sh relay remove relay-jp-12002
 
 ```text
 新增 CN 监听端口: 12002
-Remote 后端地址: 127.0.0.1:2347
+Remote 后端地址 [127.0.0.1]: （回车使用默认值）
+Remote 后端端口: 2347
 Relay 服务名 [relay-jp-12002]: （回车使用默认值）
 ```
 
-就会生成 `:12002 → chain-mtcp-jp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。线路 `cn.yaml`、`mtcp.conf` 和聚合 `runtime.yaml` 会一起备份、一起替换；共享 GOST 没能正常恢复时三者一起回滚。Watchdog 会统计该线路所有业务端口，慢路重抽前 Prewarm 还会再确认业务是否真正空闲。主业务端口和 Anchor 端口不能删除或覆盖。
+就会生成 `:12002 → chain-mtcp-jp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。新增转发和初始主业务入口使用同一套输入规则：后端主机默认 `127.0.0.1`，后端端口必须明确设置。线路 `cn.yaml`、`mtcp.conf` 和聚合 `runtime.yaml` 会一起备份、一起替换；共享 GOST 没能正常恢复时三者一起回滚。Watchdog 会统计该线路所有业务端口，慢路重抽前 Prewarm 还会再确认业务是否真正空闲。主业务端口和 Anchor 端口不能删除或覆盖。
 
 如果安装目录不是默认的 `/opt/gost-mtcp`, 管理时带上同样的环境变量:
 
