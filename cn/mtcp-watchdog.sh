@@ -19,7 +19,8 @@ load_config "$CONFIG" || exit 1
 
 LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/gost-pathlock-${LOCK_ID}-watchdog.lock"
+RUNTIME_DIR="$(ensure_mtcp_runtime_dir)" || exit 1
+LOCK="$RUNTIME_DIR/${LOCK_ID}.watchdog.lock"
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
     if (( ADOPT_MODE == 1 )); then
@@ -31,8 +32,8 @@ fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
-# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在 /run 并由
-# UNIT 派生出的全局锁保护；这里的内存值只是共享文件的当前快照。
+# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在项目专属的
+# /run/gost-ecmp-pathlock namespace，并由 UNIT 派生出的全局锁保护。
 PROCESS_RECOVERY_LOCK_FILE=""
 PROCESS_RECOVERY_STATE_FILE=""
 PROCESS_RECOVERY_EPOCHS=""
@@ -156,13 +157,24 @@ prune_epoch_list() {
 }
 
 init_process_recovery_paths() {
-    local shared_id runtime_dir
+    local shared_id runtime_dir canonical
     shared_id="${UNIT%.service}"
     shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
-    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-/run}"
-    [[ -d "$runtime_dir" ]] || mkdir -p "$runtime_dir" || return 1
-    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}-process-recovery.lock"
-    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}-process-recovery.state"
+    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-${MTCP_RUNTIME_DIR:-/run/gost-ecmp-pathlock}}"
+    [[ "$runtime_dir" == /* && "$runtime_dir" != / && ! -L "$runtime_dir" ]] || return 1
+    [[ ! -e "$runtime_dir" || -d "$runtime_dir" ]] || return 1
+    if [[ ! -d "$runtime_dir" ]]; then
+        (umask 077; mkdir -p -- "$runtime_dir") || return 1
+    fi
+    canonical="$(cd -P -- "$runtime_dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$canonical" == "$runtime_dir" ]] || return 1
+    case "$canonical" in
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            return 1
+            ;;
+    esac
+    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}.process-recovery.lock"
+    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}.process-recovery.state"
 }
 
 reset_process_recovery_state() {
@@ -182,7 +194,7 @@ load_process_recovery_state() {
         "$PROCESS_RECOVERY_STATE_FILE" 2>/dev/null || true)"
     [[ -n "$process_state_boot_id" && "$process_state_boot_id" == "$BOOT_ID" ]] || return 1
 
-    # /run 下的文件由 root Watchdog 以 0600 原子写入，内容只包含下列受校验字段。
+    # 专属 runtime 目录中的文件由 root Watchdog 以 0600 原子写入，只包含下列受校验字段。
     # shellcheck disable=SC1090
     if ! source "$PROCESS_RECOVERY_STATE_FILE"; then
         reset_process_recovery_state

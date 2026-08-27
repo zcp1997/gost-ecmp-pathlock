@@ -119,6 +119,33 @@ load_config() {
     mkdir -p "$STATE_DIR"
 }
 
+ensure_mtcp_runtime_dir() {
+    local runtime_dir="${1:-${MTCP_RUNTIME_DIR:-/run/gost-ecmp-pathlock}}" canonical
+    [[ "$runtime_dir" == /* && "$runtime_dir" != / && ! -L "$runtime_dir" ]] || {
+        echo "invalid MTCP runtime directory: $runtime_dir" >&2
+        return 1
+    }
+    if [[ -e "$runtime_dir" && ! -d "$runtime_dir" ]]; then
+        echo "MTCP runtime path is not a directory: $runtime_dir" >&2
+        return 1
+    fi
+    if [[ ! -d "$runtime_dir" ]]; then
+        (umask 077; mkdir -p -- "$runtime_dir") || return 1
+    fi
+    canonical="$(cd -P -- "$runtime_dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$canonical" == "$runtime_dir" ]] || {
+        echo "MTCP runtime directory must be canonical: $canonical" >&2
+        return 1
+    }
+    case "$canonical" in
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            echo "MTCP runtime directory is too broad: $canonical" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$runtime_dir"
+}
+
 now_epoch() { date +%s; }
 now_text() { date '+%F %T'; }
 

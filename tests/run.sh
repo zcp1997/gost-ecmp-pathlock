@@ -109,8 +109,8 @@ fi
 rm -rf "$compile_test_dir"
 pass "route compiler enforces aggregate uniqueness and fragment ownership"
 
-[[ "$(bash standalone-install.sh --version)" == *"v2.2.0" ]] || \
-    fail "standalone version was not bumped for destructive lifecycle management"
+[[ "$(bash standalone-install.sh --version)" == *"v2.2.1" ]] || \
+    fail "standalone version was not bumped for lifecycle transaction hardening"
 help_output="$(bash standalone-install.sh --help)"
 [[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* && \
    "$help_output" == *"instance remove"* && "$help_output" == *"uninstall"* && \
@@ -149,6 +149,7 @@ case "\$command_name" in
     [[ "\${MOCK_FAIL_ENABLE:-0}" != 1 ]]
     ;;
   disable)
+    [[ "\${MOCK_FAIL_DISABLE:-0}" != 1 ]] || exit 1
     for unit in "\$@"; do
       [[ "\$unit" == -* ]] && continue
       rm -f "\$wants_dir/\$unit"
@@ -183,13 +184,26 @@ case "\$command_name" in
     done
     ;;
   daemon-reload)
+    if [[ -n "\${MOCK_FAIL_DAEMON_RELOAD_ONCE_FILE:-}" && ! -e "\$MOCK_FAIL_DAEMON_RELOAD_ONCE_FILE" ]]; then
+      touch "\$MOCK_FAIL_DAEMON_RELOAD_ONCE_FILE"
+      exit 1
+    fi
     [[ "\${MOCK_FAIL_DAEMON_RELOAD:-0}" != 1 ]]
     ;;
   *) exit 0 ;;
 esac
 MOCK
     chmod +x "$integration_dir/bin/systemctl-mock"
-    for mock_command in flock timeout socat; do
+    cat > "$integration_dir/bin/flock" <<'MOCK'
+#!/usr/bin/env bash
+[[ -z "${MOCK_FLOCK_LOG:-}" ]] || printf '%s\n' "${PATHLOCK_LOCK_KIND:-unknown}" >> "$MOCK_FLOCK_LOG"
+if [[ "${MOCK_FAIL_MANAGER_LOCK:-0}" == 1 && "${PATHLOCK_LOCK_KIND:-}" == manager ]]; then
+    exit 1
+fi
+exit 0
+MOCK
+    chmod +x "$integration_dir/bin/flock"
+    for mock_command in timeout socat; do
         printf '#!/usr/bin/env bash\nexit 0\n' > "$integration_dir/bin/$mock_command"
         chmod +x "$integration_dir/bin/$mock_command"
     done
@@ -211,7 +225,8 @@ MOCK
     EMBEDDED_SOURCE="$ROOT_DIR/standalone-install.sh"
     INSTALL_BASE="$integration_dir/install"
     PATHLOCK_RUNTIME_DIR="$integration_dir/run"
-    mkdir -p "$PATHLOCK_RUNTIME_DIR"
+    PATHLOCK_LEGACY_RUNTIME_DIR="$integration_dir/legacy-run"
+    mkdir -p "$PATHLOCK_RUNTIME_DIR" "$PATHLOCK_LEGACY_RUNTIME_DIR"
     export MTCP_AUTH_PASSWORD="PathLock-Integration#2026"
     valid_mtcp_auth_password "$MTCP_AUTH_PASSWORD" || fail "valid MTCP password was rejected"
     if valid_mtcp_auth_password "too-short"; then fail "short MTCP password was accepted"; fi
@@ -316,8 +331,11 @@ MOCK
     }
     PROMPTS=(""); PROMPT_INDEX=0
     ui_action_output="$integration_dir/ui-action.out"
-    ui_run_action "测试操作" "主菜单" ui_test_failure >"$ui_action_output" 2>&1 || \
-        fail "menu action failure escaped to the whole manager"
+    set +e
+    ui_run_action "测试操作" "主菜单" ui_test_failure >"$ui_action_output" 2>&1
+    ui_action_rc=$?
+    set -e
+    (( ui_action_rc == 0 )) || fail "menu action failure escaped to the whole manager"
     [[ "$PROMPT_INDEX" == 1 ]] || fail "failed menu action did not pause before returning"
     grep -q '测试操作 失败' "$ui_action_output" || fail "failed menu action did not render an error"
     [[ ! -e "$ui_failure_tmp" ]] || fail "isolated menu action leaked temporary files"
@@ -332,8 +350,11 @@ MOCK
     }
     PROMPTS=(""); PROMPT_INDEX=0
     ui_errexit_output="$integration_dir/ui-errexit.out"
-    ui_run_action "errexit 测试" "主菜单" ui_test_errexit >"$ui_errexit_output" 2>&1 || \
-        fail "menu errexit test escaped to the manager"
+    set +e
+    ui_run_action "errexit 测试" "主菜单" ui_test_errexit >"$ui_errexit_output" 2>&1
+    ui_errexit_rc=$?
+    set -e
+    (( ui_errexit_rc == 0 )) || fail "menu errexit test escaped to the manager"
     [[ -e "$ui_errexit_before" && ! -e "$ui_errexit_after" ]] || \
         fail "menu action ignored an unhandled command failure"
     grep -q 'errexit 测试 失败' "$ui_errexit_output" || \
@@ -347,6 +368,15 @@ MOCK
     PATHLOCK_INTERACTIVE_MENU=0
 
     mkdir -p "$INSTALL_BASE/cn"
+    set +e
+    ( export MOCK_FAIL_MANAGER_LOCK=1
+      PROMPTS=(); PROMPT_INDEX=0
+      install_cn >/dev/null 2>&1 )
+    lifecycle_lock_rc=$?
+    set -e
+    (( lifecycle_lock_rc != 0 )) || fail "CN install ignored the global lifecycle lock"
+    [[ ! -e "$INSTALL_BASE/cn/config.lock" ]] || \
+        fail "CN config lock was acquired before the global lifecycle lock"
 
     # 首次安装在 enable 之后失败时，artifact rollback 还必须撤销新 unit 的
     # Wants symlink；仅删除 unit 文件会留下 broken enable 状态。
@@ -692,6 +722,10 @@ MOCK
     (( reserved_relay_name_rc != 0 )) || fail "Relay manager accepted a migration-reserved service name"
     ! grep -q '45108' "$CN_RELAY_YAML" || fail "reserved Relay service name modified route YAML"
 
+    # 之前的持久 restart 故障注入会让回滚的 best-effort restart 也失败；
+    # 恢复基线，确保下面严格验证的是“活跃控制单元 stop 失败”。
+    "$SYSTEMCTL_BIN" restart gost-mtcp.service \
+        gost-mtcp-jp-watchdog.service gost-mtcp-us-watchdog.service
     strict_stop_candidate="$(mktemp "$jp/.relay-strict-stop-test.XXXXXX")"
     awk '
       /^- name:[[:space:]]*mtcp-anchor-jp[[:space:]]*$/ && !inserted {
@@ -712,9 +746,11 @@ MOCK
       }
       { print }
     ' "$CN_RELAY_YAML" > "$strict_stop_candidate"
+    strict_stop_source_signature="$(cksum "$CN_RELAY_YAML")"
     set +e
     ( export MOCK_FAIL_STOP=1
-      apply_cn_relay_yaml "$strict_stop_candidate" "strict stop integration test" >/dev/null 2>&1 )
+      apply_cn_relay_yaml "$strict_stop_candidate" "strict stop integration test" \
+        "$strict_stop_source_signature" >/dev/null 2>&1 )
     relay_stop_failure_rc=$?
     set -e
     (( relay_stop_failure_rc != 0 )) || fail "Relay update ignored active control units that failed to stop"
@@ -741,9 +777,27 @@ MOCK
       }
       { print }
     ' "$CN_RELAY_YAML" > "$relay_candidate"
-    apply_cn_relay_yaml "$relay_candidate" "relay integration test" >/dev/null
+    relay_source_signature="$(cksum "$CN_RELAY_YAML")"
+    apply_cn_relay_yaml "$relay_candidate" "relay integration test" "$relay_source_signature" >/dev/null
     grep -q '^BUSINESS_PORTS="45100 45104 45106"$' "$CN_RELAY_CONFIG" || \
         fail "Relay manager did not synchronize BUSINESS_PORTS"
+
+    # 候选配置基于旧 fragment 生成后，另一个管理器若已经提交了更新，旧候选
+    # 必须 fail closed，不能把并发更新静默覆盖掉。
+    stale_relay_candidate="$(mktemp "$jp/.relay-stale-test.XXXXXX")"
+    cp -p "$CN_RELAY_YAML" "$stale_relay_candidate"
+    stale_relay_source_signature="$(cksum "$CN_RELAY_YAML")"
+    printf '%s\n' '# concurrent-relay-update' >> "$CN_RELAY_YAML"
+    set +e
+    ( apply_cn_relay_yaml "$stale_relay_candidate" "stale Relay candidate" \
+        "$stale_relay_source_signature" >/dev/null 2>&1 )
+    stale_relay_rc=$?
+    set -e
+    (( stale_relay_rc != 0 )) || fail "stale Relay candidate overwrote a concurrent fragment update"
+    grep -Fqx '# concurrent-relay-update' "$CN_RELAY_YAML" || \
+        fail "stale Relay rejection lost the concurrent fragment update"
+    sed -i.bak '/^# concurrent-relay-update$/d' "$CN_RELAY_YAML"
+    rm -f "$CN_RELAY_YAML.bak"
 
     failed_candidate="$(mktemp "$jp/.relay-failure-test.XXXXXX")"
     awk '
@@ -765,8 +819,10 @@ MOCK
       }
       { print }
     ' "$CN_RELAY_YAML" > "$failed_candidate"
+    failed_source_signature="$(cksum "$CN_RELAY_YAML")"
     set +e
-    ( export MOCK_FAIL_RESTART=1; apply_cn_relay_yaml "$failed_candidate" "forced failure" >/dev/null 2>&1 )
+    ( export MOCK_FAIL_RESTART=1
+      apply_cn_relay_yaml "$failed_candidate" "forced failure" "$failed_source_signature" >/dev/null 2>&1 )
     relay_failure_rc=$?
     set -e
     (( relay_failure_rc != 0 )) || fail "Relay failure simulation unexpectedly succeeded"
@@ -823,8 +879,8 @@ MOCK
         fail "failed instance removal did not restore running services"
 
     printf '%s\n' removal-log > "$us/state/remove-me.jsonl"
-    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-prewarm.lock" \
-        "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-watchdog.lock"
+    touch "$PATHLOCK_RUNTIME_DIR/us.prewarm.lock" \
+        "$PATHLOCK_RUNTIME_DIR/us.watchdog.lock"
     PROMPTS=(y); PROMPT_INDEX=0
     remove_cn_instance us >/dev/null
     [[ ! -e "$us" ]] || fail "instance removal retained the us directory or logs"
@@ -839,8 +895,8 @@ MOCK
     [[ -f "$integration_dir/systemctl-state/gost-mtcp.service" && \
        -f "$integration_dir/systemctl-state/gost-mtcp-jp-watchdog.service" ]] || \
         fail "remaining route services did not restart after instance removal"
-    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-prewarm.lock" && \
-       ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-us-watchdog.lock" ]] || \
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/us.prewarm.lock" && \
+       ! -e "$PATHLOCK_RUNTIME_DIR/us.watchdog.lock" ]] || \
         fail "instance removal retained route runtime locks"
 
     source_tree="$integration_dir/source-tree"
@@ -878,10 +934,15 @@ MOCK
         fail "source-tree cleanup deleted installer sources"
     INSTALL_BASE="$old_install_base"
 
-    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-prewarm.lock" \
-        "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-watchdog.lock" \
-        "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.lock" \
-        "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.state"
+    touch "$PATHLOCK_RUNTIME_DIR/jp.prewarm.lock" \
+        "$PATHLOCK_RUNTIME_DIR/jp.watchdog.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-mtcp.process-recovery.lock" \
+        "$PATHLOCK_RUNTIME_DIR/gost-mtcp.process-recovery.state" \
+        "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-pathlock-jp-prewarm.lock" \
+        "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-pathlock-jp-watchdog.lock" \
+        "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-mtcp-process-recovery.lock" \
+        "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-mtcp-process-recovery.state" \
+        "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-mtcp-foreign-process-recovery.state"
     PROMPTS=(y); PROMPT_INDEX=0
     remove_cn_instance jp >/dev/null
     [[ ! -e "$jp" && ! -e "$INSTALL_BASE/cn/runtime.yaml" ]] || \
@@ -891,9 +952,28 @@ MOCK
        ! -e "$SYSTEMD_DIR/gost-mtcp-jp-watchdog.service" && \
        ! -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp.service" ]] || \
         fail "last-instance removal retained CN systemd units"
-    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-jp-prewarm.lock" && \
-       ! -e "$PATHLOCK_RUNTIME_DIR/gost-mtcp-process-recovery.state" ]] || \
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/jp.prewarm.lock" && \
+       ! -e "$PATHLOCK_RUNTIME_DIR/gost-mtcp.process-recovery.state" && \
+       ! -e "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-pathlock-jp-watchdog.lock" && \
+       ! -e "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-mtcp-process-recovery.state" ]] || \
         fail "last-instance removal retained route or shared runtime state"
+    [[ -e "$PATHLOCK_LEGACY_RUNTIME_DIR/gost-mtcp-foreign-process-recovery.state" ]] || \
+        fail "runtime cleanup used a cross-project gost-mtcp wildcard"
+
+    set +e
+    ( export MOCK_FAIL_RESTART=1
+      PROMPTS=(45199); PROMPT_INDEX=0
+      install_remote >/dev/null 2>&1 )
+    first_remote_failure_rc=$?
+    set -e
+    (( first_remote_failure_rc != 0 )) || fail "first Remote restart failure unexpectedly succeeded"
+    [[ ! -e "$INSTALL_BASE/remote/gost" && ! -e "$INSTALL_BASE/remote/remote.yaml" && \
+       ! -e "$INSTALL_BASE/remote/mtcp.auth" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-remote.service" && \
+       ! -e "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service" && \
+       ! -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-remote.service" && \
+       ! -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-remote-anchor.service" ]] || \
+        fail "failed first Remote transaction leaked artifacts or enable links"
 
     PROMPTS=(45200); PROMPT_INDEX=0
     install_remote >/dev/null
@@ -919,6 +999,63 @@ MOCK
     set -e
     (( remote_reinstall_rc != 0 )) || fail "active Remote reinstall was not refused"
 
+    # 停止后的 Remote 重装必须仍是完整事务：候选校验或 systemd 提交失败时，
+    # binary、配置、凭据、units 和原 enable 状态全部恢复，且旧服务保持停止。
+    "$SYSTEMCTL_BIN" stop gost-mtcp-remote-anchor.service gost-mtcp-remote.service
+    remote_snapshot="$integration_dir/remote-snapshot"
+    mkdir -p "$remote_snapshot"
+    cp -p "$INSTALL_BASE/remote/gost" "$remote_snapshot/gost"
+    cp -p "$INSTALL_BASE/remote/remote.yaml" "$remote_snapshot/remote.yaml"
+    cp -p "$remote_auth" "$remote_snapshot/mtcp.auth"
+    cp -p "$SYSTEMD_DIR/gost-mtcp-remote.service" "$remote_snapshot/main.service"
+    cp -p "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service" "$remote_snapshot/anchor.service"
+    assert_remote_snapshot() {
+        cmp -s "$remote_snapshot/gost" "$INSTALL_BASE/remote/gost" &&
+        cmp -s "$remote_snapshot/remote.yaml" "$INSTALL_BASE/remote/remote.yaml" &&
+        cmp -s "$remote_snapshot/mtcp.auth" "$remote_auth" &&
+        cmp -s "$remote_snapshot/main.service" "$SYSTEMD_DIR/gost-mtcp-remote.service" &&
+        cmp -s "$remote_snapshot/anchor.service" "$SYSTEMD_DIR/gost-mtcp-remote-anchor.service"
+    }
+
+    set +e
+    ( export MOCK_GOST_VERSION=invalid
+      PROMPTS=(45201); PROMPT_INDEX=0
+      install_remote >/dev/null 2>&1 )
+    remote_validation_rc=$?
+    set -e
+    (( remote_validation_rc != 0 )) && assert_remote_snapshot || \
+        fail "invalid Remote candidate modified formal artifacts"
+
+    remote_reload_once="$integration_dir/remote-daemon-reload.failed-once"
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_DAEMON_RELOAD_ONCE_FILE="$remote_reload_once"
+      PROMPTS=(45202); PROMPT_INDEX=0
+      install_remote >/dev/null 2>&1 )
+    remote_reload_rc=$?
+    set -e
+    (( remote_reload_rc != 0 )) && assert_remote_snapshot || \
+        fail "Remote daemon-reload failure did not restore old artifacts"
+
+    remote_restart_once="$integration_dir/remote-restart.failed-once"
+    set +e
+    ( export MOCK_GOST_VERSION=v2 MOCK_FAIL_RESTART_ONCE_FILE="$remote_restart_once" \
+        MOCK_FAIL_DISABLE=1
+      PROMPTS=(45203); PROMPT_INDEX=0
+      install_remote >/dev/null 2>&1 )
+    remote_restart_failure_rc=$?
+    set -e
+    (( remote_restart_failure_rc != 0 )) && assert_remote_snapshot || \
+        fail "Remote restart failure did not restore old artifacts"
+    [[ -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-remote.service" &&
+       -L "$SYSTEMD_DIR/multi-user.target.wants/gost-mtcp-remote-anchor.service" ]] || \
+        fail "Remote rollback did not restore the original enable state"
+    [[ ! -e "$integration_dir/systemctl-state/gost-mtcp-remote.service" &&
+       ! -e "$integration_dir/systemctl-state/gost-mtcp-remote-anchor.service" ]] || \
+        fail "Remote rollback restarted services that were stopped before the transaction"
+    ! compgen -G "$INSTALL_BASE/remote/.remote-update.*" >/dev/null || \
+        fail "successful Remote rollback leaked its transaction backup"
+    "$SYSTEMCTL_BIN" restart gost-mtcp-remote.service gost-mtcp-remote-anchor.service
+
     PROMPTS=(cleanup 203.0.113.60 6760 45210 "" 25210 45211 40); PROMPT_INDEX=0
     install_cn >/dev/null
     [[ -e "$INSTALL_BASE/cn/instances/cleanup/cn.yaml" && \
@@ -941,7 +1078,16 @@ UNIT="$external_mtcp_unit"
 ANCHOR_UNIT="external-anchor.service"
 WATCHDOG_UNIT="external-watchdog.service"
 EOF
-    touch "$PATHLOCK_RUNTIME_DIR/gost-pathlock-stale-watchdog.lock"
+    touch "$PATHLOCK_RUNTIME_DIR/stale.watchdog.lock"
+
+    collect_project_systemd_units 2>/dev/null
+    unit_content_signature_before="$(project_systemd_unit_signature)"
+    printf '%s\n' '# concurrent same-name unit rewrite' >> "$SYSTEMD_DIR/$stale_project_unit"
+    collect_project_systemd_units 2>/dev/null
+    unit_content_signature_after="$(project_systemd_unit_signature)"
+    [[ "$unit_content_signature_before" != "$unit_content_signature_after" ]] || \
+        fail "uninstall signature ignored same-name unit content changes"
+    printf '%s\n' 'Description=GOST ECMP PathLock stale watchdog' > "$SYSTEMD_DIR/$stale_project_unit"
 
     unset PATHLOCK_UNINSTALL_CONFIRM
     PROMPTS=("not confirmed"); PROMPT_INDEX=0
@@ -1001,15 +1147,39 @@ EOF
     [[ -e "$SYSTEMD_DIR/$external_mtcp_unit" && \
        -e "$integration_dir/systemctl-state/$external_mtcp_unit" ]] || \
         fail "full uninstall deleted an unrelated gost-mtcp-prefixed service"
+
+    # 名字与 PathLock 当前/历史命名完全相同或相似，也不能替代 unit 内容中的
+    # ownership 证据。用空安装目录再次执行真实 uninstall，确认它们仍在运行。
+    external_collision_units=(
+        gost-mtcp.service
+        gost-mtcp-backup-watchdog.service
+        gost-mtcp-backup-anchor.service
+    )
+    for unit in "${external_collision_units[@]}"; do
+        cat > "$SYSTEMD_DIR/$unit" <<'EOF'
+[Unit]
+Description=External service
+[Service]
+ExecStart=/somewhere/not/pathlock
+EOF
+        "$SYSTEMCTL_BIN" enable "$unit"
+        "$SYSTEMCTL_BIN" restart "$unit"
+    done
+    PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL uninstall_pathlock >/dev/null
+    for unit in "${external_collision_units[@]}"; do
+        [[ -e "$SYSTEMD_DIR/$unit" && -e "$integration_dir/systemctl-state/$unit" ]] || \
+            fail "full uninstall claimed an external same-name unit: $unit"
+    done
     collect_project_systemd_units
     (( ${#PROJECT_SYSTEMD_UNITS[@]} == 0 )) || \
         fail "full uninstall still discovers project-owned systemd units"
-    [[ ! -e "$PATHLOCK_RUNTIME_DIR/gost-pathlock-stale-watchdog.lock" ]] || \
+    [[ ! -e "$PATHLOCK_RUNTIME_DIR/stale.watchdog.lock" ]] || \
         fail "full uninstall retained runtime lock files"
 )
 pass "standalone CLI handles install, route removal, full uninstall, isolation, and rollback"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/mtcp-tests.XXXXXX")"
+tmp_dir="$(cd -P "$tmp_dir" && pwd -P)"
 trap 'rm -rf "$tmp_dir"' EXIT
 cp cn/mtcp.conf "$tmp_dir/mtcp.conf"
 sed -i.bak 's/^BUSINESS_PORTS=.*/BUSINESS_PORTS="12000,12002 12000"/' "$tmp_dir/mtcp.conf"
@@ -1141,6 +1311,9 @@ pass "data-plane and process breakers enforce window, open, and half-open behavi
     PROCESS_RECOVERY_INTERVAL_SEC=60; PROCESS_RECOVERY_WINDOW_SEC=600
     PROCESS_RECOVERY_MAX=3; PROCESS_BREAKER_OPEN_SEC=600
     init_process_recovery_paths
+    [[ "$PROCESS_RECOVERY_LOCK_FILE" == "$MTCP_PROCESS_RUNTIME_DIR/gost-mtcp.process-recovery.lock" && \
+       "$PROCESS_RECOVERY_STATE_FILE" == "$MTCP_PROCESS_RUNTIME_DIR/gost-mtcp.process-recovery.state" ]] || \
+        fail "PROCESS recovery escaped the dedicated runtime namespace"
 
     reset_process_recovery_state
     recover_process_rate_limited 100

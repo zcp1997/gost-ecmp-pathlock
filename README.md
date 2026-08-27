@@ -159,18 +159,18 @@ bash install.sh cn
 |------|------|
 | **OS** | Linux + systemd |
 | **权限** | root |
-| **通用依赖** | bash, curl, tar, awk, grep, systemctl, sha256sum/shasum |
-| **CN 额外** | ss (iproute2), flock (util-linux), timeout (coreutils) |
+| **通用依赖** | bash, curl, tar, awk, grep, flock (util-linux), systemctl, sha256sum/shasum |
+| **CN 额外** | ss (iproute2), timeout (coreutils) |
 | **Remote 额外** | socat |
 
 Debian/Ubuntu 装依赖:
 
 ```bash
 # 通用
-apt-get install -y curl tar coreutils grep gawk systemd
+apt-get install -y curl tar coreutils grep gawk systemd util-linux
 
 # CN 端
-apt-get install -y iproute2 util-linux
+apt-get install -y iproute2
 
 # Remote 端
 apt-get install -y socat
@@ -265,7 +265,7 @@ DATA_PROBE_BREAKER_OPEN_SEC=600
 
 把 `DATA_PROBE_ENABLED` 改成 `no` 可以退回旧版行为, 只看 outer 的 TCP 状态。如果探测 endpoint 配错了或者一直失败, 10 分钟内线路 outer 重置满 3 次就会进 `FAULT/DATA_PROBE_BREAKER`, 停 10 分钟不再重置; 之后只放一次 half-open 试探, 数据面探测成功了才会关闭熔断。
 
-GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。PROCESS breaker 是共享 GOST 的全局状态：所有线路通过 `/run/gost-mtcp-process-recovery.lock` 串行读改写同一份 `/run/gost-mtcp-process-recovery.state`，共同使用一套恢复预算，而不是每条线路各算 3 次。只有同一个 MainPID 连续健康 60 秒后熔断器才会关闭；PID 换代会立即重置健康计时。所有实例的 `PROCESS_RECOVERY_GRACE_SEC`、`PROCESS_RECOVERY_INTERVAL_SEC`、`PROCESS_RECOVERY_WINDOW_SEC`、`PROCESS_RECOVERY_MAX` 和 `PROCESS_BREAKER_OPEN_SEC` 必须一致，CN 安装、升级及 Relay 配置事务发现参数漂移时会 fail closed。
+GOST 触发 systemd 的 `StartLimit` 后, Watchdog 会低频做 `reset-failed + restart`, 默认 10 分钟最多 3 次, 再多就进 `FAULT/PROCESS_BREAKER`。PROCESS breaker 是共享 GOST 的全局状态：所有线路通过 `/run/gost-ecmp-pathlock/gost-mtcp.process-recovery.lock` 串行读改写同一份 `/run/gost-ecmp-pathlock/gost-mtcp.process-recovery.state`，共同使用一套恢复预算，而不是每条线路各算 3 次。只有同一个 MainPID 连续健康 60 秒后熔断器才会关闭；PID 换代会立即重置健康计时。所有实例的 `PROCESS_RECOVERY_GRACE_SEC`、`PROCESS_RECOVERY_INTERVAL_SEC`、`PROCESS_RECOVERY_WINDOW_SEC`、`PROCESS_RECOVERY_MAX` 和 `PROCESS_BREAKER_OPEN_SEC` 必须一致，CN 安装、升级及 Relay 配置事务发现参数漂移时会 fail closed。
 
 ### 故障恢复路径(均已实测)
 
@@ -320,7 +320,7 @@ CN 全机只运行一个 `gost-mtcp.service`。每条线路保留独立的 fragm
 
 聚合配置中的对象名按线路隔离，例如 `tcp-entry-jp`、`mtcp-anchor-jp`、`chain-mtcp-jp`。每条线路必须使用唯一的 Remote `IP:port`；否则同一 PID 下无法可靠判断某条 outer 属于哪条线路，安装器和编译器都会拒绝。编译器还会 fail closed 校验 fragment ownership：`jp` fragment 必须定义 `chain-mtcp-jp` 和 `mtcp-anchor-jp`，其中每个 service 只能引用 `chain-mtcp-jp`，不能借用聚合文件中另一条线路的 chain。
 
-新增/重装线路会先在隔离 staging 中准备并校验候选 GOST binary、`mtcp-lib.sh`、`mtcp-prewarm.sh`、`mtcp-watchdog.sh`、`compile-config.sh`、`runtime.yaml`、线路文件和 units；全部通过后才停止各线路 Anchor/Watchdog，并把这些 shared artifacts 纳入同一个备份、提交和回滚事务，然后只重启一次共享 GOST。这个管理动作会中断所有线路的现有连接；菜单检测到活跃业务时会显示连接数并要求再次明确确认，直接命令或自动化则默认拒绝，需设置 `CN_FORCE_RESTART=1`。运行期间的慢路重抽、stale outer 和单线路恢复只重置对应 Remote endpoint，不重启共享进程。
+新增/重装线路会先在隔离 staging 中准备并校验候选 GOST binary、`mtcp-lib.sh`、`mtcp-prewarm.sh`、`mtcp-watchdog.sh`、`compile-config.sh`、`runtime.yaml`、线路文件和 units；全部通过后才停止各线路 Anchor/Watchdog，并把这些 shared artifacts 纳入同一个备份、提交和回滚事务，然后只重启一次共享 GOST。Standalone 的 Remote 重装也会先用候选 GOST 校验候选 YAML，再事务提交 binary、配置、凭据和 units；`daemon-reload`、`enable`、`restart` 或健康检查失败都会恢复旧 artifacts 与原 enable 状态。这个管理动作会中断所有线路的现有连接；菜单检测到活跃业务时会显示连接数并要求再次明确确认，直接命令或自动化则默认拒绝，需设置 `CN_FORCE_RESTART=1`。运行期间的慢路重抽、stale outer 和单线路恢复只重置对应 Remote endpoint，不重启共享进程。
 
 当前管理策略是“已安装线路即受管且 Watchdog 常开”：CN 配置事务结束时会重新 enable/restart 所有已安装线路的 Watchdog。手工 `disable --now` 不是持久 maintenance 状态，后续配置变更会重新启用；如需线路维护模式，应先实现显式的 route enable/disable 状态再改变这一策略。
 
@@ -352,7 +352,7 @@ Remote 后端端口: 2347
 Relay 服务名 [relay-jp-12002]: （回车使用默认值）
 ```
 
-就会生成 `:12002 → chain-mtcp-jp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。新增转发和初始主业务入口使用同一套输入规则：后端主机默认 `127.0.0.1`，后端端口必须明确设置。线路 `cn.yaml`、`mtcp.conf` 和聚合 `runtime.yaml` 会一起备份、一起替换；共享 GOST 没能正常恢复时三者一起回滚。Watchdog 会统计该线路所有业务端口，慢路重抽前 Prewarm 还会再确认业务是否真正空闲。主业务端口和 Anchor 端口不能删除或覆盖。
+就会生成 `:12002 → chain-mtcp-jp → 127.0.0.1:2347`, 同时把 `12002` 写进 `BUSINESS_PORTS`。新增转发和初始主业务入口使用同一套输入规则：后端主机默认 `127.0.0.1`，后端端口必须明确设置。线路 `cn.yaml`、`mtcp.conf` 和聚合 `runtime.yaml` 会一起备份、一起替换；共享 GOST 没能正常恢复时三者一起回滚。Relay 候选在确认前记录源 fragment 签名，拿到锁后会再次校验；若另一个管理器已经修改同一线路，本次操作会要求重新执行，而不是覆盖并发更新。Watchdog 会统计该线路所有业务端口，慢路重抽前 Prewarm 还会再确认业务是否真正空闲。主业务端口和 Anchor 端口不能删除或覆盖。
 
 如果安装目录不是默认的 `/opt/gost-mtcp`, 管理时带上同样的环境变量:
 
@@ -372,7 +372,7 @@ INSTALL_BASE=/root/mtcpjpv22 bash standalone-install.sh relay
 bash standalone-install.sh instance remove jp
 ```
 
-删除前会展示 Remote、业务端口、实例目录、活跃连接数和剩余线路数，并要求再次确认。操作会删除该实例的 fragment、鉴权文件、状态、JSONL 日志、Anchor/Watchdog unit 和 `/run` 锁文件。还有其他线路时，安装器会先生成并校验不含目标实例的新 `runtime.yaml`，再重启共享 GOST，让剩余线路重新建连；提交或重启失败会恢复实例、聚合配置与 units。删除最后一条线路时，会一并停止、disable 并删除共享 `gost-mtcp.service`。
+删除前会展示 Remote、业务端口、实例目录、活跃连接数和剩余线路数，并要求再次确认。操作会删除该实例的 fragment、鉴权文件、状态、JSONL 日志、Anchor/Watchdog unit 和 `/run/gost-ecmp-pathlock/` 中对应的锁文件。还有其他线路时，安装器会先生成并校验不含目标实例的新 `runtime.yaml`，再重启共享 GOST，让剩余线路重新建连；提交或重启失败会恢复实例、聚合配置与 units。删除最后一条线路时，会一并停止、disable 并删除共享 `gost-mtcp.service`。
 
 主菜单的 `[6]` 用于完全卸载，也可直接执行：
 
@@ -382,7 +382,7 @@ bash standalone-install.sh uninstall
 PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL bash standalone-install.sh uninstall
 ```
 
-完全卸载会先列出并确认所有项目服务已经停止，再删除 standalone 与传统安装方式产生的 PathLock systemd units、enable 链接、CN/Remote 运行组件、配置、凭据、状态、JSONL 日志及 `/run` 锁文件。单元识别同时依据已安装配置、项目专用名称和 unit 的 PathLock 标记，不会仅因其他服务名称以 `gost-mtcp` 开头就删除。若 `INSTALL_BASE` 是源码仓库，只清除安装产物并恢复 canonical 模板，不删除仓库和安装脚本；普通 `/opt/gost-mtcp` 部署会删除整个 `cn/`、`remote/` 运行目录。源码方式管理时需和安装时一样指定仓库的规范绝对路径，例如 `INSTALL_BASE=/root/gost-ecmp-pathlock bash standalone-install.sh uninstall`；为防止路径穿越，实例删除和完全卸载都会拒绝根目录、过宽目录、符号链接、`..` 和带尾斜杠的 `INSTALL_BASE`，并要求 `SYSTEMD_DIR` 同样是无符号链接的规范绝对路径。systemd journal 使用全机共享文件，安装器不会为了删除某个项目的历史记录而执行会波及其他服务的全局 vacuum；用户自行配置的防火墙规则以及系统级 `socat` 等软件包也不会被修改。
+完全卸载会先列出并确认所有项目服务已经停止，再删除 standalone 与传统安装方式产生的 PathLock systemd units、enable 链接、CN/Remote 运行组件、配置、凭据、状态、JSONL 日志及 `/run/gost-ecmp-pathlock/` 运行状态。unit 名称只用于发现候选；必须由 unit 内容引用当前安装目录，或由 `Description`/内容携带明确的 `GOST ECMP PathLock` 标记，才会被认定为项目所有。即使名称恰好是 `gost-mtcp.service` 或匹配 `gost-mtcp-*-watchdog.service`，缺少 ownership 证据也不会删除；确认后还会在锁内复核 unit 名称与内容签名。Standalone 管理器内的安装、CN/Relay 配置、实例删除与完全卸载会先串行获取同一个 `/run/gost-ecmp-pathlock/manager.lock` lifecycle lock，再按固定顺序获取 CN config lock，避免不同维护事务互撞。若 `INSTALL_BASE` 是源码仓库，只清除安装产物并恢复 canonical 模板，不删除仓库和安装脚本；普通 `/opt/gost-mtcp` 部署会删除整个 `cn/`、`remote/` 运行目录。源码方式管理时需和安装时一样指定仓库的规范绝对路径，例如 `INSTALL_BASE=/root/gost-ecmp-pathlock bash standalone-install.sh uninstall`；为防止路径穿越，实例删除和完全卸载都会拒绝根目录、过宽目录、符号链接、`..` 和带尾斜杠的 `INSTALL_BASE`，并要求 `SYSTEMD_DIR` 同样是无符号链接的规范绝对路径。systemd journal 使用全机共享文件，安装器不会为了删除某个项目的历史记录而执行会波及其他服务的全局 vacuum；用户自行配置的防火墙规则以及系统级 `socat` 等软件包也不会被修改。
 
 ## 重要注意事项
 

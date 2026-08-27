@@ -10,11 +10,13 @@ set -euo pipefail
 #   wget https://raw.githubusercontent.com/.../standalone-install.sh
 #   bash standalone-install.sh
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 INSTALL_BASE="${INSTALL_BASE:-/opt/gost-mtcp}"
 GOST_VERSION="${GOST_VERSION:-v3.2.6}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+PATHLOCK_RUNTIME_DIR="${PATHLOCK_RUNTIME_DIR:-/run/gost-ecmp-pathlock}"
+PATHLOCK_MANAGER_LOCK_OPEN=0
 EMBEDDED_SOURCE=""
 PROMPT_FD=0
 PROMPT_FD_READY=0
@@ -152,7 +154,7 @@ ui_run_action() {
     (( had_errexit == 0 )) || set -e
 
     if (( rc != 0 )); then
-        ui_error "$label 失败（exit $rc）"
+        ui_error "$label 失败（exit ${rc}）"
     fi
     ui_pause "$return_target"
     return 0
@@ -366,6 +368,57 @@ check_command() {
     command -v "$cmd" &>/dev/null || die "缺少命令: $cmd"
 }
 
+ensure_pathlock_runtime_dir() {
+    local canonical
+    [[ "$PATHLOCK_RUNTIME_DIR" == /* && "$PATHLOCK_RUNTIME_DIR" != / &&
+       ! -L "$PATHLOCK_RUNTIME_DIR" ]] || {
+        echo "拒绝使用不安全或为符号链接的 PathLock 运行目录: $PATHLOCK_RUNTIME_DIR" >&2
+        return 1
+    }
+    if [[ -e "$PATHLOCK_RUNTIME_DIR" && ! -d "$PATHLOCK_RUNTIME_DIR" ]]; then
+        echo "PathLock 运行目录存在但不是目录: $PATHLOCK_RUNTIME_DIR" >&2
+        return 1
+    fi
+    if [[ ! -d "$PATHLOCK_RUNTIME_DIR" ]]; then
+        (umask 077; mkdir -p -- "$PATHLOCK_RUNTIME_DIR") || return 1
+    fi
+    canonical="$(cd -P -- "$PATHLOCK_RUNTIME_DIR" 2>/dev/null && pwd -P)" || return 1
+    [[ "$canonical" == "$PATHLOCK_RUNTIME_DIR" ]] || {
+        echo "PathLock 运行目录必须使用规范绝对路径: $canonical" >&2
+        return 1
+    }
+    case "$canonical" in
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            echo "拒绝使用过于宽泛的 PathLock 运行目录: $canonical" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 固定锁顺序与 FD：7=lifecycle、8=CN config；交互终端保留 FD 9。
+acquire_pathlock_manager_lock() {
+    local lock_file
+    (( PATHLOCK_MANAGER_LOCK_OPEN == 0 )) || die "内部错误：lifecycle lock 被重复获取"
+    ensure_pathlock_runtime_dir || die "无法准备 PathLock lifecycle lock 目录"
+    lock_file="$PATHLOCK_RUNTIME_DIR/manager.lock"
+    [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] || \
+        die "拒绝使用不安全的 lifecycle lock: $lock_file"
+    (umask 077; : >> "$lock_file") || die "无法创建 lifecycle lock: $lock_file"
+    chmod 0600 "$lock_file" || die "无法收紧 lifecycle lock 权限: $lock_file"
+    exec 7>>"$lock_file" || die "无法打开 lifecycle lock: $lock_file"
+    if ! PATHLOCK_LOCK_KIND=manager flock -n 7; then
+        exec 7>&-
+        die "另一项 PathLock 安装、配置或卸载操作正在进行"
+    fi
+    PATHLOCK_MANAGER_LOCK_OPEN=1
+}
+
+release_pathlock_manager_lock() {
+    (( PATHLOCK_MANAGER_LOCK_OPEN == 1 )) || return 0
+    exec 7>&-
+    PATHLOCK_MANAGER_LOCK_OPEN=0
+}
+
 # bash 从管道或 process substitution 读取脚本时，$0 不是可重复读取的普通文件。
 # main 执行时脚本尾部尚未被解释，先保存嵌入区，供后续多次提取。
 prepare_embedded_source() {
@@ -456,7 +509,8 @@ write_mtcp_auth_file() {
 # 从脚本末尾提取嵌入的文件
 extract_embedded() {
     local marker="$1"
-    sed -n "/^### BEGIN ${marker} ###$/,/^### END ${marker} ###$/p" "$EMBEDDED_SOURCE" | sed '1d;$d'
+    sed -n "/^### BEGIN ${marker} ###$/,/^### END ${marker} ###$/p" "$EMBEDDED_SOURCE" |
+        sed '1d;$d' | sed '${/^$/d;}'
 }
 
 select_install_role() {
@@ -662,12 +716,12 @@ stop_systemd_units_strict() {
         "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1 || active_rc=$?
         case "$active_rc" in
             0)
-                echo "$label 停止后仍在运行: $unit（systemctl stop exit $stop_rc）" >&2
+                echo "$label 停止后仍在运行: ${unit}（systemctl stop exit ${stop_rc}）" >&2
                 failed=1
                 ;;
             3|4) ;;
             *)
-                echo "无法确认 $label 状态: $unit（systemctl is-active exit $active_rc，stop exit $stop_rc）" >&2
+                echo "无法确认 $label 状态: ${unit}（systemctl is-active exit ${active_rc}，stop exit ${stop_rc}）" >&2
                 failed=1
                 ;;
         esac
@@ -693,7 +747,7 @@ ensure_cn_port_available() {
     if [[ -f "$current_config" ]]; then
         values="$(awk -F= '
             $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
-                value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
+                value=substr($0,index($0,"=")+1); gsub(/^[\047\042]|[\047\042]$/, "", value); print value
             }
         ' "$current_config")"
         values="${values//,/ }"
@@ -711,7 +765,7 @@ ensure_cn_port_available() {
            "$config" == "$INSTALL_BASE/cn/mtcp.conf" ]] && continue
         values="$(awk -F= '
             $1 == "BUSINESS_PORT" || $1 == "BUSINESS_PORTS" || $1 == "ANCHOR_PORT" {
-                value=substr($0,index($0,"=")+1); gsub(/^[\047\"]|[\047\"]$/, "", value); print value
+                value=substr($0,index($0,"=")+1); gsub(/^[\047\042]|[\047\042]$/, "", value); print value
             }
         ' "$config")"
         values="${values//,/ }"
@@ -881,7 +935,7 @@ cn_process_policy_value() {
         $1 == wanted {
             value=substr($0,index($0,"=")+1)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-            gsub(/^[\047\"]|[\047\"]$/, "", value)
+            gsub(/^[\047\042]|[\047\042]$/, "", value)
             found++
         }
         END {
@@ -958,7 +1012,7 @@ stop_cn_route_controls() {
             case "$active_rc" in
                 0)
                     if (( strict == 1 )); then
-                        echo "控制单元停止后仍在运行: $unit（systemctl stop exit $stop_rc）" >&2
+                        echo "控制单元停止后仍在运行: ${unit}（systemctl stop exit ${stop_rc}）" >&2
                         failed=1
                     fi
                     ;;
@@ -968,7 +1022,7 @@ stop_cn_route_controls() {
                 *)
                     # D-Bus/systemd 查询异常不能被当作 inactive；严格事务必须 fail closed。
                     if (( strict == 1 )); then
-                        echo "无法确认控制单元状态: $unit（systemctl is-active exit $active_rc，stop exit $stop_rc）" >&2
+                        echo "无法确认控制单元状态: ${unit}（systemctl is-active exit ${active_rc}，stop exit ${stop_rc}）" >&2
                         failed=1
                     fi
                     ;;
@@ -1039,10 +1093,19 @@ start_cn_route_watchdogs() {
 install_remote() {
     echo; echo "==> 开始安装 Remote 端"; echo
     check_command curl; check_command tar; check_command "$SYSTEMCTL_BIN"; check_command socat
+    check_command flock
 
     local remote_dir="$INSTALL_BASE/remote" main_unit="gost-mtcp-remote.service"
     local anchor_unit="gost-mtcp-remote-anchor.service" mtcp_port socat_bin
-    local auth_file auth_password config_tmp auth_tmp main_tmp anchor_tmp
+    local auth_file auth_password stage_dir config_candidate auth_candidate main_tmp anchor_tmp
+    local backup_dir commit_ok=1 failure_stage=""
+    local main_was_enabled=0 anchor_was_enabled=0
+    if [[ "${PATHLOCK_SOURCE_TREE:-0}" == 1 ]]; then
+        main_unit="gost-ecmp-pathlock-remote.service"
+        anchor_unit="gost-ecmp-pathlock-remote-anchor-endpoint.service"
+    fi
+
+    acquire_pathlock_manager_lock
     ensure_units_inactive "Remote" "$main_unit" "$anchor_unit"
     mkdir -p "$remote_dir" "$SYSTEMD_DIR"
     socat_bin="$(command -v socat)"
@@ -1056,11 +1119,14 @@ install_remote() {
     get_mtcp_auth_password auth_password "请设置 Remote MTCP 鉴权密码"
     auth_file="$remote_dir/mtcp.auth"
 
-    download_gost remote "$remote_dir"
-    config_tmp="$(mktemp "$remote_dir/.remote.yaml.XXXXXX")"
-    auth_tmp="$(mktemp "$remote_dir/.mtcp.auth.XXXXXX")"
-    CLEANUP_PATHS+=("$config_tmp" "$auth_tmp")
-    write_mtcp_auth_file "$auth_tmp" "$auth_password"
+    # Remote 与 CN 使用同一事务原则：所有候选文件先在隔离目录中生成、用候选
+    # GOST 校验，再一次性提交；systemd 任一步失败都恢复旧 artifacts 与 enable 状态。
+    stage_dir="$(mktemp -d "$remote_dir/.remote-candidate.XXXXXX")"
+    CLEANUP_PATHS+=("$stage_dir")
+    download_gost remote "$stage_dir"
+    config_candidate="$stage_dir/remote.yaml"
+    auth_candidate="$stage_dir/mtcp.auth"
+    write_mtcp_auth_file "$auth_candidate" "$auth_password"
     extract_embedded REMOTE_YAML | awk -v addr=":$mtcp_port" -v auth_file="$auth_file" '
         function yaml_quote(value) {
             gsub(/\047/, "\047\047", value)
@@ -1102,13 +1168,13 @@ install_remote() {
             if (service_seen != 1 || listen_updated != 1 || auth_ref_updated != 1 ||
                 authers_seen != 1 || mtcp_auther_seen != 1 || auth_path_updated != 1) exit 42
         }
-    ' > "$config_tmp" || die "canonical Remote 监听或鉴权配置结构不符合预期"
-    chmod 0644 "$config_tmp"
-    mv -f "$auth_tmp" "$auth_file"
-    mv -f "$config_tmp" "$remote_dir/remote.yaml"
+    ' > "$config_candidate" || die "canonical Remote 监听或鉴权配置结构不符合预期"
+    chmod 0644 "$config_candidate"
+    "$stage_dir/gost" -C "$config_candidate" -O yaml >/dev/null || \
+        die "Remote 候选配置未通过候选 GOST 解析校验"
 
-    main_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote.XXXXXX")"
-    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.gost-mtcp-remote-anchor.XXXXXX")"
+    main_tmp="$(mktemp "$SYSTEMD_DIR/.${main_unit}.XXXXXX")"
+    anchor_tmp="$(mktemp "$SYSTEMD_DIR/.${anchor_unit}.XXXXXX")"
     CLEANUP_PATHS+=("$main_tmp" "$anchor_tmp")
     extract_embedded REMOTE_MAIN_SERVICE | sed \
         -e "s|/root/gost-ecmp-pathlock/remote|$remote_dir|g" \
@@ -1118,15 +1184,112 @@ install_remote() {
         -e "s|/usr/bin/socat|$socat_bin|g" \
         > "$anchor_tmp"
     chmod 0644 "$main_tmp" "$anchor_tmp"
-    mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit"
-    mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit"
+    grep -Fqx "WorkingDirectory=$remote_dir" "$main_tmp" &&
+        grep -Fqx "ExecStart=$remote_dir/gost -D -C $remote_dir/remote.yaml" "$main_tmp" || \
+        die "Remote main unit 渲染校验失败"
+    grep -Fq "ExecStart=$socat_bin " "$anchor_tmp" || die "Remote Anchor unit 渲染校验失败"
 
-    "$SYSTEMCTL_BIN" daemon-reload
-    "$SYSTEMCTL_BIN" enable "$main_unit" "$anchor_unit"
-    "$SYSTEMCTL_BIN" restart "$main_unit" "$anchor_unit"
-    "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" || die "$main_unit 启动失败"
-    "$SYSTEMCTL_BIN" is-active --quiet "$anchor_unit" || die "$anchor_unit 启动失败"
+    backup_dir="$(mktemp -d "$remote_dir/.remote-update.XXXXXX")" || die "无法创建 Remote 事务备份目录"
+    remote_backup_one() {
+        local path="$1" key="$2"
+        if [[ -e "$path" || -L "$path" ]]; then
+            cp -p "$path" "$backup_dir/$key" || return 1
+            : > "$backup_dir/$key.exists"
+        fi
+    }
+    remote_restore_one() {
+        local path="$1" key="$2"
+        if [[ -e "$backup_dir/$key.exists" ]]; then
+            cp -p "$backup_dir/$key" "$path" || return 1
+        else
+            rm -f -- "$path" || return 1
+        fi
+    }
+    remote_unit_enabled_artifact() {
+        local unit="$1" link
+        for link in "$SYSTEMD_DIR"/*.target.wants/"$unit" "$SYSTEMD_DIR"/*.target.requires/"$unit"; do
+            [[ -e "$link" || -L "$link" ]] && return 0
+        done
+        return 1
+    }
+    remote_remove_enable_artifacts() {
+        local unit="$1" link failed=0
+        for link in "$SYSTEMD_DIR"/*.target.wants/"$unit" "$SYSTEMD_DIR"/*.target.requires/"$unit"; do
+            [[ -e "$link" || -L "$link" ]] || continue
+            rm -f -- "$link" || failed=1
+        done
+        (( failed == 0 ))
+    }
+    remote_rollback() {
+        local ok=1
+        stop_systemd_units_strict "Remote rollback" "$anchor_unit" "$main_unit" \
+            >/dev/null 2>&1 || ok=0
+        "$SYSTEMCTL_BIN" disable "$anchor_unit" "$main_unit" >/dev/null 2>&1 || true
+        remote_remove_enable_artifacts "$main_unit" || ok=0
+        remote_remove_enable_artifacts "$anchor_unit" || ok=0
+        remote_restore_one "$remote_dir/gost" gost || ok=0
+        remote_restore_one "$remote_dir/remote.yaml" remote-yaml || ok=0
+        remote_restore_one "$auth_file" remote-auth || ok=0
+        remote_restore_one "$SYSTEMD_DIR/$main_unit" main-unit || ok=0
+        remote_restore_one "$SYSTEMD_DIR/$anchor_unit" anchor-unit || ok=0
+        "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || ok=0
+        if (( main_was_enabled == 1 )); then
+            "$SYSTEMCTL_BIN" enable "$main_unit" >/dev/null 2>&1 || ok=0
+        else
+            "$SYSTEMCTL_BIN" disable "$main_unit" >/dev/null 2>&1 || ok=0
+        fi
+        if (( anchor_was_enabled == 1 )); then
+            "$SYSTEMCTL_BIN" enable "$anchor_unit" >/dev/null 2>&1 || ok=0
+        else
+            "$SYSTEMCTL_BIN" disable "$anchor_unit" >/dev/null 2>&1 || ok=0
+        fi
+        (( ok == 1 ))
+    }
 
+    remote_unit_enabled_artifact "$main_unit" && main_was_enabled=1
+    remote_unit_enabled_artifact "$anchor_unit" && anchor_was_enabled=1
+    if ! remote_backup_one "$remote_dir/gost" gost ||
+       ! remote_backup_one "$remote_dir/remote.yaml" remote-yaml ||
+       ! remote_backup_one "$auth_file" remote-auth ||
+       ! remote_backup_one "$SYSTEMD_DIR/$main_unit" main-unit ||
+       ! remote_backup_one "$SYSTEMD_DIR/$anchor_unit" anchor-unit; then
+        rm -rf -- "$backup_dir"
+        die "无法备份 Remote 事务所需 artifacts"
+    fi
+
+    if ! mv -f "$stage_dir/gost" "$remote_dir/gost" ||
+       ! mv -f "$config_candidate" "$remote_dir/remote.yaml" ||
+       ! mv -f "$auth_candidate" "$auth_file" ||
+       ! mv -f "$main_tmp" "$SYSTEMD_DIR/$main_unit" ||
+       ! mv -f "$anchor_tmp" "$SYSTEMD_DIR/$anchor_unit"; then
+        commit_ok=0; failure_stage="提交 Remote artifacts"
+    fi
+    if (( commit_ok == 1 )) && ! "$SYSTEMCTL_BIN" daemon-reload; then
+        commit_ok=0; failure_stage="systemd daemon-reload"
+    fi
+    if (( commit_ok == 1 )) && ! "$SYSTEMCTL_BIN" enable "$main_unit" "$anchor_unit"; then
+        commit_ok=0; failure_stage="systemd enable"
+    fi
+    if (( commit_ok == 1 )) && ! "$SYSTEMCTL_BIN" restart "$main_unit" "$anchor_unit"; then
+        commit_ok=0; failure_stage="systemd restart"
+    fi
+    if (( commit_ok == 1 )) &&
+       { ! "$SYSTEMCTL_BIN" is-active --quiet "$main_unit" ||
+         ! "$SYSTEMCTL_BIN" is-active --quiet "$anchor_unit"; }; then
+        commit_ok=0; failure_stage="服务健康检查"
+    fi
+
+    if (( commit_ok == 0 )); then
+        echo "Remote 安装失败（${failure_stage}），正在回滚。" >&2
+        if remote_rollback; then
+            rm -rf -- "$backup_dir"
+            die "Remote 更新未生效，旧 artifacts 与 enable 状态已恢复"
+        fi
+        die "Remote 更新失败且自动回滚不完整；保留现场: $backup_dir"
+    fi
+
+    rm -rf -- "$backup_dir" "$stage_dir"
+    release_pathlock_manager_lock
     cat <<DONE
 
 ============================================================
@@ -1159,9 +1322,10 @@ install_cn() {
 
     cn_dir="$INSTALL_BASE/cn"
     runtime_yaml="$cn_dir/runtime.yaml"
+    acquire_pathlock_manager_lock
     mkdir -p "$cn_dir/instances" "$SYSTEMD_DIR"
     exec 8>"$cn_dir/config.lock"
-    flock -n 8 || die "另一项 CN 配置操作正在进行"
+    PATHLOCK_LOCK_KIND=config flock -n 8 || die "另一项 CN 配置操作正在进行"
     validate_cn_process_policy_consistency "$cn_dir" || \
         die "已安装线路的共享 PROCESS recovery 参数不一致；请统一后再安装或升级"
 
@@ -1479,6 +1643,7 @@ install_cn() {
     fi
 
     exec 8>&-
+    release_pathlock_manager_lock
     cat <<DONE
 
 ============================================================
@@ -1510,7 +1675,7 @@ read_config_value() {
         $1 == wanted {
             value = substr($0, index($0, "=") + 1)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-            gsub(/^['\''\"]|['\''\"]$/, "", value)
+            gsub(/^[\047\042]|[\047\042]$/, "", value)
             print value
             exit
         }
@@ -1520,31 +1685,41 @@ read_config_value() {
 add_project_systemd_unit() {
     local unit="$1" existing
     valid_systemd_service_name "$unit" || return 0
-    for existing in "${PROJECT_SYSTEMD_UNITS[@]}"; do
+    for existing in "${PROJECT_SYSTEMD_UNITS[@]:-}"; do
+        [[ -n "$existing" ]] || continue
         [[ "$existing" == "$unit" ]] && return 0
     done
     PROJECT_SYSTEMD_UNITS+=("$unit")
 }
 
 systemd_unit_belongs_to_pathlock() {
-    local unit="$1" path="${2:-}" description
-    case "$unit" in
-        gost-mtcp.service|gost-mtcp-remote.service|gost-mtcp-remote-anchor.service|gost-ecmp-pathlock*.service|gost-mtcp-*-anchor.service|gost-mtcp-*-watchdog.service)
+    local unit="$1" path="${2:-}" description candidate
+    valid_systemd_service_name "$unit" || return 1
+
+    # 名字只能用于发现候选，不能作为 ownership 证据。尤其 gost-mtcp.service
+    # 与 gost-mtcp-*-{anchor,watchdog}.service 都可能由同机其他项目使用。
+    for candidate in "$path" "$SYSTEMD_DIR/$unit"; do
+        [[ -n "$candidate" && -r "$candidate" ]] || continue
+        if grep -Fq 'GOST ECMP PathLock' "$candidate" ||
+           grep -Fq -- "$INSTALL_BASE/" "$candidate"; then
             return 0
-            ;;
-    esac
-    if [[ -n "$path" && -r "$path" ]] &&
-       grep -Eq 'GOST ECMP PathLock|gost-ecmp-pathlock|/gost-mtcp(/|$)' "$path"; then
-        return 0
-    fi
+        fi
+    done
     description="$("$SYSTEMCTL_BIN" show -p Description --value "$unit" 2>/dev/null || true)"
     [[ "$description" == *"GOST ECMP PathLock"* ]]
 }
 
 project_systemd_unit_signature() {
-    local unit
-    for unit in "${PROJECT_SYSTEMD_UNITS[@]}"; do
-        printf '%s\n' "$unit"
+    local unit path target checksum description
+    for unit in "${PROJECT_SYSTEMD_UNITS[@]:-}"; do
+        [[ -n "$unit" ]] || continue
+        path="$SYSTEMD_DIR/$unit"
+        target=""
+        checksum="missing"
+        [[ ! -L "$path" ]] || target="$(readlink "$path" 2>/dev/null || true)"
+        [[ ! -r "$path" ]] || checksum="$(cksum "$path")"
+        description="$("$SYSTEMCTL_BIN" show -p Description --value "$unit" 2>/dev/null || true)"
+        printf '%s\t%s\t%s\t%s\n' "$unit" "$target" "$checksum" "$description"
     done | LC_ALL=C sort
 }
 
@@ -1608,6 +1783,7 @@ collect_project_systemd_units() {
         '
     )
     for unit in "${known_units[@]}"; do
+        systemd_unit_belongs_to_pathlock "$unit" "$SYSTEMD_DIR/$unit" || continue
         if systemd_unit_artifact_exists "$unit" ||
            "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1; then
             add_project_systemd_unit "$unit"
@@ -1634,14 +1810,38 @@ restore_embedded_source_file() {
 }
 
 purge_pathlock_runtime_locks() {
-    local runtime_dir="${PATHLOCK_RUNTIME_DIR:-/run}"
-    [[ -d "$runtime_dir" ]] || return 0
-    rm -f -- "$runtime_dir"/gost-pathlock-*-prewarm.lock \
-        "$runtime_dir"/gost-pathlock-*-watchdog.lock \
-        "$runtime_dir"/gost-mtcp*-process-recovery.lock \
-        "$runtime_dir"/gost-mtcp*-process-recovery.state \
-        "$runtime_dir"/gost-ecmp-pathlock*-process-recovery.lock \
-        "$runtime_dir"/gost-ecmp-pathlock*-process-recovery.state
+    local runtime_dir="$PATHLOCK_RUNTIME_DIR" legacy_dir="${PATHLOCK_LEGACY_RUNTIME_DIR:-/run}"
+    local config route unit shared_id path
+
+    # 新版状态全部位于项目专属目录，因此只在这个 namespace 内使用 glob；
+    # manager.lock 必须保留到 lifecycle 事务释放，避免出现两个 lock inode。
+    if [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]]; then
+        for path in "$runtime_dir"/*.prewarm.lock "$runtime_dir"/*.watchdog.lock \
+            "$runtime_dir"/*.process-recovery.lock "$runtime_dir"/*.process-recovery.state \
+            "$runtime_dir"/*.tmp.*; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            rm -f -- "$path" || return 1
+        done
+    fi
+
+    # 兼容升级时只按已安装配置推导并清理旧版 /run 文件；禁止 gost-mtcp*
+    # 这类宽泛 glob，以免跨项目删除同名状态。
+    [[ -d "$legacy_dir" && ! -L "$legacy_dir" ]] || return 0
+    for config in "$INSTALL_BASE"/cn/instances/*/mtcp.conf "$INSTALL_BASE"/cn/mtcp.conf; do
+        [[ -r "$config" ]] || continue
+        route="$(read_config_value "$config" ROUTE_ID 2>/dev/null || true)"
+        [[ -n "$route" ]] || route="$(basename "$(dirname "$config")")"
+        if [[ "$route" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+            rm -f -- "$legacy_dir/gost-pathlock-${route}-prewarm.lock" \
+                "$legacy_dir/gost-pathlock-${route}-watchdog.lock" || return 1
+        fi
+        unit="$(read_config_value "$config" UNIT 2>/dev/null || true)"
+        valid_systemd_service_name "$unit" || continue
+        shared_id="${unit%.service}"
+        shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
+        rm -f -- "$legacy_dir/${shared_id}-process-recovery.lock" \
+            "$legacy_dir/${shared_id}-process-recovery.state" || return 1
+    done
 }
 
 validate_systemd_cleanup_dir() {
@@ -1704,7 +1904,8 @@ remove_pathlock_installed_data() {
             "$cn_dir"/runtime.yaml.bak.* "$cn_dir"/runtime.yaml.failed.* || failed=1
         for path in "$cn_dir"/.shared-candidate.* "$cn_dir"/.runtime-candidate.* \
             "$cn_dir"/.runtime-relay-candidate.* "$cn_dir"/.shared-update.* \
-            "$cn_dir"/.instance-remove-* "$remote_dir"/.remote.yaml.* \
+            "$cn_dir"/.instance-remove-* "$remote_dir"/.remote-candidate.* \
+            "$remote_dir"/.remote-update.* "$remote_dir"/.remote.yaml.* \
             "$remote_dir"/.mtcp.auth.* "$remote_dir"/.gost.*; do
             [[ -e "$path" || -L "$path" ]] || continue
             rm -rf -- "$path" || failed=1
@@ -2071,13 +2272,25 @@ validate_cn_relay_yaml() {
 }
 
 apply_cn_relay_yaml() {
-    local candidate="$1" action="$2" backup failed config_backup config_failed
+    local candidate="$1" action="$2" source_signature="${3:-}"
+    local backup failed config_backup config_failed current_signature
     local runtime_candidate runtime_candidate_dir runtime_backup runtime_failed
     local config_candidate ports stamp restart_ok=0
 
+    check_command cksum
+    check_command flock
+    [[ -n "$source_signature" ]] || die "缺少 Relay 源配置签名，拒绝提交候选配置"
     CLEANUP_PATHS+=("$candidate")
+    acquire_pathlock_manager_lock
     exec 8>"$CN_ROOT/config.lock"
-    flock -n 8 || { rm -f "$candidate"; die "另一项 CN 配置操作正在进行"; }
+    PATHLOCK_LOCK_KIND=config flock -n 8 || { rm -f "$candidate"; die "另一项 CN 配置操作正在进行"; }
+    current_signature="$(cksum "$CN_RELAY_YAML")" || die "无法重新读取线路 fragment"
+    if [[ "$current_signature" != "$source_signature" ]]; then
+        rm -f "$candidate"
+        exec 8>&-
+        release_pathlock_manager_lock
+        die "线路配置在确认期间发生变化，请重新操作"
+    fi
     if ! validate_cn_relay_yaml "$candidate"; then
         rm -f "$candidate"
         die "生成的线路 fragment 未通过结构检查，原配置未修改"
@@ -2153,6 +2366,7 @@ apply_cn_relay_yaml() {
 
     if (( restart_ok == 1 )); then
         exec 8>&-
+        release_pathlock_manager_lock
         ui_success "$action"
         echo "Watchdog BUSINESS_PORTS 已同步为: $ports"
         echo "聚合配置已更新: $CN_RUNTIME_YAML"
@@ -2174,13 +2388,15 @@ apply_cn_relay_yaml() {
     "$SYSTEMCTL_BIN" restart "$CN_RELAY_UNIT" >/dev/null 2>&1 || true
     start_cn_route_watchdogs "$CN_ROOT" >/dev/null 2>&1 || true
     exec 8>&-
+    release_pathlock_manager_lock
     die "Relay 修改未生效；已回滚。失败配置: $failed, $config_failed, $runtime_failed"
 }
 
 add_cn_relay() {
-    local listen_port backend service_name default_name active
+    local listen_port backend service_name default_name active source_signature
     local existing_name existing_listen existing_backend existing_chain candidate
     CN_RESTART_CONFIRMED_COUNT=""
+    source_signature="$(cksum "$CN_RELAY_YAML")" || die "无法读取线路 fragment"
 
     while :; do
         prompt_read listen_port "新增 CN 监听端口（例如 12002）: " || die "未输入监听端口"
@@ -2257,13 +2473,14 @@ add_cn_relay() {
         rm -f "$candidate"
         die "没有找到 ${CN_RELAY_ANCHOR_SERVICE}，拒绝修改未知结构的线路 fragment"
     fi
-    apply_cn_relay_yaml "$candidate" "已增加 :$listen_port -> $backend"
+    apply_cn_relay_yaml "$candidate" "已增加 :$listen_port -> $backend" "$source_signature"
 }
 
 remove_cn_relay() {
-    local requested="${1:-}" name listen backend chain line candidate active
+    local requested="${1:-}" name listen backend chain line candidate active source_signature
     local -a candidates=()
     CN_RESTART_CONFIRMED_COUNT=""
+    source_signature="$(cksum "$CN_RELAY_YAML")" || die "无法读取线路 fragment"
 
     while IFS=$'\t' read -r name listen backend chain; do
         [[ "$name" == "$CN_RELAY_ANCHOR_SERVICE" || "$listen" == ":$CN_PRIMARY_PORT" || \
@@ -2329,12 +2546,14 @@ remove_cn_relay() {
         rm -f "$candidate"
         die "删除失败，cn.yaml 未修改"
     fi
-    apply_cn_relay_yaml "$candidate" "已删除 ${name}（$listen -> ${backend}）"
+    apply_cn_relay_yaml "$candidate" "已删除 ${name}（$listen -> ${backend}）" "$source_signature"
 }
 
 manage_cn_relays() {
     local action="${1:-}" target="${2:-}" route_yaml="${3:-}" route_config="${4:-}" choice redraw=1
     check_command awk
+    check_command cksum
+    check_command flock
     check_command "$SYSTEMCTL_BIN"
 
     if [[ -z "$route_yaml" && -z "${CN_YAML_PATH:-}" && -z "${CN_INSTANCE:-}" ]]; then
@@ -2410,15 +2629,27 @@ find_cn_route_by_id() {
 }
 
 purge_cn_instance_runtime_locks() {
-    local route="$1" shared_unit="${2:-}" runtime_dir="${PATHLOCK_RUNTIME_DIR:-/run}" shared_id
-    [[ -d "$runtime_dir" ]] || return 0
-    rm -f -- "$runtime_dir/gost-pathlock-${route}-prewarm.lock" \
-        "$runtime_dir/gost-pathlock-${route}-watchdog.lock"
+    local route="$1" shared_unit="${2:-}" runtime_dir="$PATHLOCK_RUNTIME_DIR"
+    local legacy_dir="${PATHLOCK_LEGACY_RUNTIME_DIR:-/run}" shared_id
+    if [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]]; then
+        rm -f -- "$runtime_dir/${route}.prewarm.lock" \
+            "$runtime_dir/${route}.watchdog.lock" || return 1
+    fi
+    if [[ -d "$legacy_dir" && ! -L "$legacy_dir" ]]; then
+        rm -f -- "$legacy_dir/gost-pathlock-${route}-prewarm.lock" \
+            "$legacy_dir/gost-pathlock-${route}-watchdog.lock" || return 1
+    fi
     if [[ -n "$shared_unit" ]]; then
         shared_id="${shared_unit%.service}"
         shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
-        rm -f -- "$runtime_dir/${shared_id}-process-recovery.lock" \
-            "$runtime_dir/${shared_id}-process-recovery.state"
+        if [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]]; then
+            rm -f -- "$runtime_dir/${shared_id}.process-recovery.lock" \
+                "$runtime_dir/${shared_id}.process-recovery.state" || return 1
+        fi
+        if [[ -d "$legacy_dir" && ! -L "$legacy_dir" ]]; then
+            rm -f -- "$legacy_dir/${shared_id}-process-recovery.lock" \
+                "$legacy_dir/${shared_id}-process-recovery.state" || return 1
+        fi
     fi
 }
 
@@ -2497,13 +2728,14 @@ remove_cn_instance() {
     active="$(cn_active_business_count "$cn_dir")"
     ui_instance_remove_card "$route" "${dst:-未知}:${remote_port:-未知}" "${ports:-未知}" \
         "$instance_dir" "$remaining_count" "$active"
-    if ! ui_confirm "确认永久删除实例 $route？[y/N] › "; then
+    if ! ui_confirm "确认永久删除实例 ${route}？[y/N] › "; then
         ui_warn "已取消，实例未修改"
         return 0
     fi
 
+    acquire_pathlock_manager_lock
     exec 8>"$cn_dir/config.lock"
-    flock -n 8 || die "另一项 CN 配置操作正在进行"
+    PATHLOCK_LOCK_KIND=config flock -n 8 || die "另一项 CN 配置操作正在进行"
     [[ -f "$route_config" && -f "$route_yaml" && ! -L "$instance_dir" &&
        ! -L "$route_config" && ! -L "$route_yaml" &&
        "$(cd -P -- "$instance_dir" 2>/dev/null && pwd -P)" == "$instance_dir" ]] || \
@@ -2640,7 +2872,7 @@ remove_cn_instance() {
     fi
 
     if (( commit_ok == 0 )); then
-        echo "删除实例失败（$failure_stage），正在回滚。" >&2
+        echo "删除实例失败（${failure_stage}），正在回滚。" >&2
         if [[ -d "$quarantine" && ! -e "$instance_dir" ]]; then
             mv "$quarantine" "$instance_dir" || rollback_ok=0
         elif [[ -d "$quarantine" ]]; then
@@ -2676,6 +2908,7 @@ remove_cn_instance() {
         purge_cn_instance_runtime_locks "$route" || cleanup_ok=0
     fi
     (( cleanup_ok == 1 )) || die "实例已从运行配置删除，但残留文件清理失败，请检查 $quarantine_root"
+    release_pathlock_manager_lock
 
     ui_success "已彻底删除 CN 实例 $route"
     if (( remaining_count > 0 )); then
@@ -2690,6 +2923,7 @@ uninstall_pathlock() {
     local lock_open=0 confirmed_unit_signature current_unit_signature
 
     check_command "$SYSTEMCTL_BIN"
+    check_command cksum
     check_command flock
     check_command sort
     validate_pathlock_cleanup_base || die "INSTALL_BASE 不适合执行完全卸载"
@@ -2719,9 +2953,10 @@ uninstall_pathlock() {
         ui_warn "已通过 PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL 确认完全卸载"
     fi
 
+    acquire_pathlock_manager_lock
     if [[ -d "$cn_dir" ]]; then
         exec 8>"$cn_dir/config.lock"
-        flock -n 8 || die "另一项 CN 配置操作正在进行"
+        PATHLOCK_LOCK_KIND=config flock -n 8 || die "另一项 CN 配置操作正在进行"
         lock_open=1
     fi
     collect_project_systemd_units
@@ -2731,18 +2966,20 @@ uninstall_pathlock() {
         die "确认期间 PathLock systemd 单元集合发生变化，请检查后重新执行卸载"
     fi
 
-    if ! stop_systemd_units_strict "PathLock systemd 单元" "${PROJECT_SYSTEMD_UNITS[@]}"; then
+    if ! stop_systemd_units_strict "PathLock systemd 单元" "${PROJECT_SYSTEMD_UNITS[@]:-}"; then
         (( lock_open == 0 )) || exec 8>&-
         die "仍有 PathLock 服务无法确认停止；未删除安装数据"
     fi
 
-    for unit in "${PROJECT_SYSTEMD_UNITS[@]}"; do
+    for unit in "${PROJECT_SYSTEMD_UNITS[@]:-}"; do
+        [[ -n "$unit" ]] || continue
         remove_systemd_unit_artifacts "$unit" || failed=1
     done
     if ! "$SYSTEMCTL_BIN" daemon-reload; then
         failed=1
     fi
-    for unit in "${PROJECT_SYSTEMD_UNITS[@]}"; do
+    for unit in "${PROJECT_SYSTEMD_UNITS[@]:-}"; do
+        [[ -n "$unit" ]] || continue
         if systemd_unit_artifact_exists "$unit" ||
            "$SYSTEMCTL_BIN" is-active --quiet "$unit" >/dev/null 2>&1; then
             echo "systemd 单元仍有残留: $unit" >&2
@@ -2759,13 +2996,16 @@ uninstall_pathlock() {
         die "systemd 单元清理不完整；安装数据暂未删除，可修复 systemd 后重试"
     fi
 
+    if ! purge_pathlock_runtime_locks; then
+        (( lock_open == 0 )) || exec 8>&-
+        die "systemd 单元已删除，但 PathLock 运行状态清理失败"
+    fi
     if ! remove_pathlock_installed_data; then
         (( lock_open == 0 )) || exec 8>&-
         die "systemd 单元已删除，但安装目录清理失败: $INSTALL_BASE"
     fi
-    purge_pathlock_runtime_locks || failed=1
     (( lock_open == 0 )) || exec 8>&-
-    (( failed == 0 )) || die "运行组件已卸载，但 /run 下仍有 PathLock 锁文件残留"
+    release_pathlock_manager_lock
 
     ui_success "PathLock 已完全卸载"
     echo "已删除项目 systemd 单元、运行组件、配置、凭据、状态与 JSONL 日志。"
@@ -2943,7 +3183,7 @@ main() {
         instance)
             case "$instance_action" in
                 remove|delete|rm) remove_cn_instance "$instance_target" ;;
-                *) die "未知 instance 操作: $instance_action（仅支持 remove）" ;;
+                *) die "未知 instance 操作: ${instance_action}（仅支持 remove）" ;;
             esac
             ;;
         uninstall) uninstall_pathlock ;;
@@ -3160,7 +3400,7 @@ STUCK_RESTART_AFTER_SEC="60"
 RESTART_COOLDOWN_SEC="60"
 MULTI_CONFIRM_COUNT="2"
 # GOST 因 systemd StartLimit 等原因停止时，低频尝试 reset-failed + restart。
-# PROCESS breaker/budget 属于共享 UNIT，状态写入 /run/gost-mtcp-process-recovery.state；
+# PROCESS breaker/budget 属于共享 UNIT，状态写入 /run/gost-ecmp-pathlock/gost-mtcp.process-recovery.state；
 # 所有线路必须使用完全一致的 effective 参数；CN 配置事务发现漂移会 fail closed。
 PROCESS_RECOVERY_GRACE_SEC="10"
 PROCESS_RECOVERY_INTERVAL_SEC="60"
@@ -3591,6 +3831,33 @@ load_config() {
     mkdir -p "$STATE_DIR"
 }
 
+ensure_mtcp_runtime_dir() {
+    local runtime_dir="${1:-${MTCP_RUNTIME_DIR:-/run/gost-ecmp-pathlock}}" canonical
+    [[ "$runtime_dir" == /* && "$runtime_dir" != / && ! -L "$runtime_dir" ]] || {
+        echo "invalid MTCP runtime directory: $runtime_dir" >&2
+        return 1
+    }
+    if [[ -e "$runtime_dir" && ! -d "$runtime_dir" ]]; then
+        echo "MTCP runtime path is not a directory: $runtime_dir" >&2
+        return 1
+    fi
+    if [[ ! -d "$runtime_dir" ]]; then
+        (umask 077; mkdir -p -- "$runtime_dir") || return 1
+    fi
+    canonical="$(cd -P -- "$runtime_dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$canonical" == "$runtime_dir" ]] || {
+        echo "MTCP runtime directory must be canonical: $canonical" >&2
+        return 1
+    }
+    case "$canonical" in
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            echo "MTCP runtime directory is too broad: $canonical" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$runtime_dir"
+}
+
 now_epoch() { date +%s; }
 now_text() { date '+%F %T'; }
 
@@ -3834,7 +4101,8 @@ esac
 
 LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/gost-pathlock-${LOCK_ID}-prewarm.lock"
+RUNTIME_DIR="$(ensure_mtcp_runtime_dir)" || exit 30
+LOCK="$RUNTIME_DIR/${LOCK_ID}.prewarm.lock"
 exec {LOCKFD}>"$LOCK"
 flock -n "$LOCKFD" || exit 75
 
@@ -4045,7 +4313,8 @@ load_config "$CONFIG" || exit 1
 
 LOCK_ID="${ROUTE_ID:-${UNIT%.service}}"
 LOCK_ID="${LOCK_ID//[^A-Za-z0-9_.@-]/_}"
-LOCK="/run/gost-pathlock-${LOCK_ID}-watchdog.lock"
+RUNTIME_DIR="$(ensure_mtcp_runtime_dir)" || exit 1
+LOCK="$RUNTIME_DIR/${LOCK_ID}.watchdog.lock"
 exec {LOCKFD}>"$LOCK"
 if ! flock -n "$LOCKFD"; then
     if (( ADOPT_MODE == 1 )); then
@@ -4057,8 +4326,8 @@ fi
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
 
-# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在 /run 并由
-# UNIT 派生出的全局锁保护；这里的内存值只是共享文件的当前快照。
+# PROCESS recovery 属于共享 GOST，而不是任一线路。状态保存在项目专属的
+# /run/gost-ecmp-pathlock namespace，并由 UNIT 派生出的全局锁保护。
 PROCESS_RECOVERY_LOCK_FILE=""
 PROCESS_RECOVERY_STATE_FILE=""
 PROCESS_RECOVERY_EPOCHS=""
@@ -4182,13 +4451,24 @@ prune_epoch_list() {
 }
 
 init_process_recovery_paths() {
-    local shared_id runtime_dir
+    local shared_id runtime_dir canonical
     shared_id="${UNIT%.service}"
     shared_id="${shared_id//[^A-Za-z0-9_.@-]/_}"
-    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-/run}"
-    [[ -d "$runtime_dir" ]] || mkdir -p "$runtime_dir" || return 1
-    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}-process-recovery.lock"
-    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}-process-recovery.state"
+    runtime_dir="${MTCP_PROCESS_RUNTIME_DIR:-${MTCP_RUNTIME_DIR:-/run/gost-ecmp-pathlock}}"
+    [[ "$runtime_dir" == /* && "$runtime_dir" != / && ! -L "$runtime_dir" ]] || return 1
+    [[ ! -e "$runtime_dir" || -d "$runtime_dir" ]] || return 1
+    if [[ ! -d "$runtime_dir" ]]; then
+        (umask 077; mkdir -p -- "$runtime_dir") || return 1
+    fi
+    canonical="$(cd -P -- "$runtime_dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$canonical" == "$runtime_dir" ]] || return 1
+    case "$canonical" in
+        /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            return 1
+            ;;
+    esac
+    PROCESS_RECOVERY_LOCK_FILE="$runtime_dir/${shared_id}.process-recovery.lock"
+    PROCESS_RECOVERY_STATE_FILE="$runtime_dir/${shared_id}.process-recovery.state"
 }
 
 reset_process_recovery_state() {
@@ -4208,7 +4488,7 @@ load_process_recovery_state() {
         "$PROCESS_RECOVERY_STATE_FILE" 2>/dev/null || true)"
     [[ -n "$process_state_boot_id" && "$process_state_boot_id" == "$BOOT_ID" ]] || return 1
 
-    # /run 下的文件由 root Watchdog 以 0600 原子写入，内容只包含下列受校验字段。
+    # 专属 runtime 目录中的文件由 root Watchdog 以 0600 原子写入，只包含下列受校验字段。
     # shellcheck disable=SC1090
     if ! source "$PROCESS_RECOVERY_STATE_FILE"; then
         reset_process_recovery_state
