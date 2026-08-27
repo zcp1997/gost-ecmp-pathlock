@@ -1,7 +1,7 @@
 gost-ecmp-pathlock quick start
 
 生产环境推荐保存并使用单文件 standalone-install.sh；无参数运行即打开统一管理菜单。
-克隆项目进行开发/调试时，根目录 install.sh 是源码安装入口。
+克隆项目进行开发/调试时，根目录 install.sh 是源码角色入口，CN 与 Remote 都委托 standalone 的同一套事务实现。
 CN 和 Remote 目录下没有、也不需要单独的安装脚本。
 
 Standalone：

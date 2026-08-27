@@ -10,7 +10,7 @@ set -euo pipefail
 #   wget https://raw.githubusercontent.com/.../standalone-install.sh
 #   bash standalone-install.sh
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 INSTALL_BASE="${INSTALL_BASE:-/opt/gost-mtcp}"
 GOST_VERSION="${GOST_VERSION:-v3.2.6}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
@@ -1693,18 +1693,29 @@ add_project_systemd_unit() {
 }
 
 systemd_unit_belongs_to_pathlock() {
-    local unit="$1" path="${2:-}" description candidate
+    local unit="$1" path="${2:-}" description candidate canonical_path checked_path=""
     valid_systemd_service_name "$unit" || return 1
+    canonical_path="$SYSTEMD_DIR/$unit"
 
     # 名字只能用于发现候选，不能作为 ownership 证据。尤其 gost-mtcp.service
     # 与 gost-mtcp-*-{anchor,watchdog}.service 都可能由同机其他项目使用。
-    for candidate in "$path" "$SYSTEMD_DIR/$unit"; do
-        [[ -n "$candidate" && -r "$candidate" ]] || continue
-        if grep -Fq 'GOST ECMP PathLock' "$candidate" ||
-           grep -Fq -- "$INSTALL_BASE/" "$candidate"; then
-            return 0
+    # 只要磁盘 artifact 存在，其当前内容就是最高权威；内容不匹配或不可读时
+    # 必须 fail closed，不能再用 systemd 尚未 daemon-reload 的旧 Description 认领。
+    for candidate in "$canonical_path" "$path"; do
+        [[ -n "$candidate" ]] || continue
+        [[ "$candidate" != "$checked_path" ]] || continue
+        checked_path="$candidate"
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            [[ -r "$candidate" ]] || return 1
+            if grep -Fq 'GOST ECMP PathLock' "$candidate" ||
+               grep -Fq -- "$INSTALL_BASE/" "$candidate"; then
+                return 0
+            fi
+            return 1
         fi
     done
+
+    # 仅用于“磁盘 unit 已不存在、systemd 仍保留 loaded unit”的清理场景。
     description="$("$SYSTEMCTL_BIN" show -p Description --value "$unit" 2>/dev/null || true)"
     [[ "$description" == *"GOST ECMP PathLock"* ]]
 }

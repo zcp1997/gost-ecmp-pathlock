@@ -130,6 +130,8 @@ bash /root/standalone-install.sh
 
 **传统方式(开发/调试用, 能看到完整代码)**
 
+源码入口 `install.sh` 只负责角色选择；无论选择 CN 还是 Remote，都会把源码目录作为安装根目录并委托给 `standalone-install.sh` 的同一套事务实现，不再维护第二份安装逻辑。
+
 ```bash
 # Remote 服务器（先安装并设置鉴权密码）
 git clone https://github.com/zcp1997/gost-ecmp-pathlock.git
@@ -382,7 +384,7 @@ bash standalone-install.sh uninstall
 PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL bash standalone-install.sh uninstall
 ```
 
-完全卸载会先列出并确认所有项目服务已经停止，再删除 standalone 与传统安装方式产生的 PathLock systemd units、enable 链接、CN/Remote 运行组件、配置、凭据、状态、JSONL 日志及 `/run/gost-ecmp-pathlock/` 运行状态。unit 名称只用于发现候选；必须由 unit 内容引用当前安装目录，或由 `Description`/内容携带明确的 `GOST ECMP PathLock` 标记，才会被认定为项目所有。即使名称恰好是 `gost-mtcp.service` 或匹配 `gost-mtcp-*-watchdog.service`，缺少 ownership 证据也不会删除；确认后还会在锁内复核 unit 名称与内容签名。Standalone 管理器内的安装、CN/Relay 配置、实例删除与完全卸载会先串行获取同一个 `/run/gost-ecmp-pathlock/manager.lock` lifecycle lock，再按固定顺序获取 CN config lock，避免不同维护事务互撞。若 `INSTALL_BASE` 是源码仓库，只清除安装产物并恢复 canonical 模板，不删除仓库和安装脚本；普通 `/opt/gost-mtcp` 部署会删除整个 `cn/`、`remote/` 运行目录。源码方式管理时需和安装时一样指定仓库的规范绝对路径，例如 `INSTALL_BASE=/root/gost-ecmp-pathlock bash standalone-install.sh uninstall`；为防止路径穿越，实例删除和完全卸载都会拒绝根目录、过宽目录、符号链接、`..` 和带尾斜杠的 `INSTALL_BASE`，并要求 `SYSTEMD_DIR` 同样是无符号链接的规范绝对路径。systemd journal 使用全机共享文件，安装器不会为了删除某个项目的历史记录而执行会波及其他服务的全局 vacuum；用户自行配置的防火墙规则以及系统级 `socat` 等软件包也不会被修改。
+完全卸载会先列出并确认所有项目服务已经停止，再删除 standalone 与传统安装方式产生的 PathLock systemd units、enable 链接、CN/Remote 运行组件、配置、凭据、状态、JSONL 日志及 `/run/gost-ecmp-pathlock/` 运行状态。unit 名称只用于发现候选；磁盘 unit artifact 存在时，必须由其当前内容引用安装目录或携带明确的 `GOST ECMP PathLock` 标记，才会被认定为项目所有，绝不会回退使用 systemd 尚未 reload 的旧 Description；仅在磁盘 artifact 已不存在但 unit 仍处于 loaded 状态时，才用 `systemctl show` 的 Description 兜底。即使名称恰好是 `gost-mtcp.service` 或匹配 `gost-mtcp-*-watchdog.service`，缺少 ownership 证据也不会删除；确认后还会在锁内复核 unit 名称与内容签名。Standalone 管理器内的安装、CN/Relay 配置、实例删除与完全卸载会先串行获取同一个 `/run/gost-ecmp-pathlock/manager.lock` lifecycle lock，再按固定顺序获取 CN config lock，避免不同维护事务互撞。若 `INSTALL_BASE` 是源码仓库，只清除安装产物并恢复 canonical 模板，不删除仓库和安装脚本；普通 `/opt/gost-mtcp` 部署会删除整个 `cn/`、`remote/` 运行目录。源码方式管理时需和安装时一样指定仓库的规范绝对路径，例如 `INSTALL_BASE=/root/gost-ecmp-pathlock bash standalone-install.sh uninstall`；为防止路径穿越，实例删除和完全卸载都会拒绝根目录、过宽目录、符号链接、`..` 和带尾斜杠的 `INSTALL_BASE`，并要求 `SYSTEMD_DIR` 同样是无符号链接的规范绝对路径。systemd journal 使用全机共享文件，安装器不会为了删除某个项目的历史记录而执行会波及其他服务的全局 vacuum；用户自行配置的防火墙规则以及系统级 `socat` 等软件包也不会被修改。
 
 ## 重要注意事项
 
@@ -447,7 +449,7 @@ IFS= read -r -n 1 reply <&3 || exit 1
 ```
 gost-ecmp-pathlock/
 ├── standalone-install.sh      # 单文件自包含安装器
-├── install.sh                  # 传统安装器(需要完整项目)
+├── install.sh                  # 源码角色入口（CN/Remote 均委托 standalone）
 ├── scripts/
 │   └── generate-standalone.sh # 从 canonical 文件生成 standalone 嵌入区
 ├── tests/

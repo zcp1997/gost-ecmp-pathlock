@@ -76,8 +76,31 @@ grep -Fqx '      addr: backend.example.invalid:1' cn/cn.yaml || \
     fail "canonical CN template does not use a non-routable backend placeholder"
 ! grep -Fq '127.0.0.1:2345' cn/cn.yaml || \
     fail "canonical CN template still silently targets the old default backend"
-grep -Fq 'bash "$PROJECT_ROOT/standalone-install.sh" cn' install.sh || \
-    fail "traditional installer does not delegate to the shared CN implementation"
+grep -Fq 'bash "$PROJECT_ROOT/standalone-install.sh" "$role"' install.sh &&
+grep -Fqx '    run_standalone_role cn' install.sh &&
+grep -Fqx '    run_standalone_role remote' install.sh ||
+    fail "traditional installer does not delegate both roles to standalone"
+! grep -Eq '^[[:space:]]*(configure_listen_port|download_gost|install_systemd_units)\(\)' install.sh ||
+    fail "traditional installer still contains a duplicate Remote implementation"
+(
+    delegate_dir="$(mktemp -d "${TMPDIR:-/tmp}/pathlock-delegate.XXXXXX")"
+    trap 'rm -rf "$delegate_dir"' EXIT
+    awk '$0 == "main \"$@\"" { exit } { print }' install.sh > "$delegate_dir/core.sh"
+    # shellcheck disable=SC1090
+    source "$delegate_dir/core.sh"
+    PROJECT_ROOT="$ROOT_DIR"
+    bash() {
+        printf '%s|%s|%s|%s|%s|%s|%s\n' \
+            "$1" "$2" "$INSTALL_BASE" "$PATHLOCK_SOURCE_TREE" "$GOST_VERSION" \
+            "$SYSTEMD_DIR" "$SYSTEMCTL_BIN" >> "$delegate_dir/calls"
+    }
+    GOST_VERSION=v-test SYSTEMD_DIR=/test/systemd SYSTEMCTL_BIN=/test/systemctl install_cn
+    GOST_VERSION=v-test SYSTEMD_DIR=/test/systemd SYSTEMCTL_BIN=/test/systemctl install_remote
+    grep -Fqx "$ROOT_DIR/standalone-install.sh|cn|$ROOT_DIR|1|v-test|/test/systemd|/test/systemctl" \
+        "$delegate_dir/calls" || fail "traditional CN delegation lost arguments or environment"
+    grep -Fqx "$ROOT_DIR/standalone-install.sh|remote|$ROOT_DIR|1|v-test|/test/systemd|/test/systemctl" \
+        "$delegate_dir/calls" || fail "traditional Remote delegation lost arguments or environment"
+)
 ! grep -Eq '^[[:space:]]*password:' remote/remote.yaml cn/cn.yaml || fail "plaintext password embedded in YAML"
 grep -Fqx 'ExecStart=/root/gost-ecmp-pathlock/cn/gost -D -C /root/gost-ecmp-pathlock/cn/runtime.yaml' \
     cn/gost-ecmp-pathlock.service || fail "canonical CN unit does not use the aggregate config"
@@ -109,8 +132,8 @@ fi
 rm -rf "$compile_test_dir"
 pass "route compiler enforces aggregate uniqueness and fragment ownership"
 
-[[ "$(bash standalone-install.sh --version)" == *"v2.2.1" ]] || \
-    fail "standalone version was not bumped for lifecycle transaction hardening"
+[[ "$(bash standalone-install.sh --version)" == *"v2.2.2" ]] || \
+    fail "standalone version was not bumped for installer unification and ownership hardening"
 help_output="$(bash standalone-install.sh --help)"
 [[ "$help_output" == *"打开统一管理菜单"* && "$help_output" == *"CN_INSTANCE"* && \
    "$help_output" == *"instance remove"* && "$help_output" == *"uninstall"* && \
@@ -170,7 +193,16 @@ case "\$command_name" in
     [[ "\${MOCK_FAIL_STOP:-0}" == 1 ]] && exit 1
     for unit in "\$@"; do rm -f "\$state_dir/\$unit"; done
     ;;
-  show) echo 0 ;;
+  show)
+    show_unit=""
+    for show_arg in "\$@"; do show_unit="\$show_arg"; done
+    if [[ "\$*" == *Description* && \
+          "\${MOCK_STALE_PATHLOCK_DESCRIPTION_UNIT:-}" == "\$show_unit" ]]; then
+      echo 'GOST ECMP PathLock stale cached description'
+    else
+      echo 0
+    fi
+    ;;
   list-units)
     for state in "\$state_dir"/*.service; do
       [[ -f "\$state" ]] || continue
@@ -1165,6 +1197,20 @@ EOF
         "$SYSTEMCTL_BIN" enable "$unit"
         "$SYSTEMCTL_BIN" restart "$unit"
     done
+
+    # 磁盘上的同名外部 unit 必须压过 systemd 尚未 daemon-reload 的旧
+    # PathLock Description；仅在磁盘 artifact 消失后才允许缓存信息兜底。
+    stale_cache_unit="${external_collision_units[0]}"
+    export MOCK_STALE_PATHLOCK_DESCRIPTION_UNIT="$stale_cache_unit"
+    if systemd_unit_belongs_to_pathlock "$stale_cache_unit" "$SYSTEMD_DIR/$stale_cache_unit"; then
+        fail "stale systemd Description overrode an external on-disk unit"
+    fi
+    mv "$SYSTEMD_DIR/$stale_cache_unit" "$SYSTEMD_DIR/$stale_cache_unit.saved"
+    systemd_unit_belongs_to_pathlock "$stale_cache_unit" || \
+        fail "loaded PathLock unit without a disk artifact lost its Description fallback"
+    mv "$SYSTEMD_DIR/$stale_cache_unit.saved" "$SYSTEMD_DIR/$stale_cache_unit"
+    unset MOCK_STALE_PATHLOCK_DESCRIPTION_UNIT
+
     PATHLOCK_UNINSTALL_CONFIRM=DELETE_ALL uninstall_pathlock >/dev/null
     for unit in "${external_collision_units[@]}"; do
         [[ -e "$SYSTEMD_DIR/$unit" && -e "$integration_dir/systemctl-state/$unit" ]] || \
